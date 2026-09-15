@@ -199,6 +199,8 @@ def detect_chords_for_audio(audio_path: str, duration: int | None = 120):
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr, trim=False)
     tempo_arr = np.asarray(tempo).reshape(-1)
     bpm = int(np.round(float(tempo_arr[0]))) if tempo_arr.size else 120
+    if bpm <= 0:
+        bpm = 120
     if len(beats) < 8:
         beats = librosa.frames_to_samples(librosa.util.fix_frames(np.arange(0, len(y) // 512, max(1, int((60 / bpm) * sr / 512)))))
         beats = librosa.samples_to_frames(beats)
