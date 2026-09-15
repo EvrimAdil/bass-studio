@@ -8,3 +8,5 @@ pydub>=0.25.0
 numpy>=1.24.0
 requests>=2.31.0
 yt-dlp>=2026.8.19
+essentia>=2.1b6.dev1000
+audio-separator[cpu]>=0.47.0
