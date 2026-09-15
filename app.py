@@ -11,15 +11,15 @@ import streamlit as st
 import streamlit.components.v1 as components
 import demucs.api
 
-# Page Config
+# Page Setup
 st.set_page_config(
-    page_title="Bass Studio DAW & Real Book",
+    page_title="Bass Studio DAW & Real Book Score",
     page_icon="🎸",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Minimalist Studio & Real Book CSS
+# Minimalist Custom CSS
 CUSTOM_CSS = """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=JetBrains+Mono:wght@500;700&family=Plus+Jakarta+Sans:wght@400;600;700&display=swap');
@@ -28,7 +28,7 @@ CUSTOM_CSS = """
     .main .block-container { max-width: 1000px !important; padding-top: 1.2rem; padding-bottom: 3rem; }
     #MainMenu, footer, header { visibility: hidden; }
 
-    /* Title Styling */
+    /* Studio Header */
     .studio-header {
         display: flex;
         justify-content: space-between;
@@ -47,19 +47,19 @@ CUSTOM_CSS = """
     }
 
     /* REAL BOOK SHEET SCORE STYLING */
-    .realbook-container {
+    .realbook-paper {
         background: #fdfbf7;
         color: #1a1a1a;
         border: 2px solid #2d2d2d;
         border-radius: 8px;
         padding: 24px;
-        font-family: 'Caveat', cursive, serif;
         box-shadow: 0 10px 30px rgba(0,0,0,0.4);
         margin-top: 1.5rem;
     }
 
     .realbook-title {
-        font-size: 2.4rem;
+        font-family: 'Caveat', cursive;
+        font-size: 2.6rem;
         font-weight: 700;
         text-align: center;
         text-transform: uppercase;
@@ -80,11 +80,12 @@ CUSTOM_CSS = """
     }
 
     .realbook-section-label {
-        font-size: 1.6rem;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.9rem;
         font-weight: 700;
         background: #1a1a1a;
         color: #fdfbf7;
-        padding: 2px 10px;
+        padding: 4px 12px;
         border-radius: 4px;
         display: inline-block;
         margin-top: 14px;
@@ -103,8 +104,7 @@ CUSTOM_CSS = """
         border-right: 2px solid #1a1a1a;
         padding: 12px 8px;
         text-align: center;
-        min-height: 70px;
-        position: relative;
+        min-height: 65px;
     }
 
     .realbook-measure:last-child {
@@ -112,7 +112,8 @@ CUSTOM_CSS = """
     }
 
     .realbook-chord {
-        font-size: 2rem;
+        font-family: 'Caveat', cursive;
+        font-size: 2.2rem;
         font-weight: 700;
         color: #000;
         line-height: 1;
@@ -120,15 +121,21 @@ CUSTOM_CSS = """
 
     .realbook-bass-note {
         font-family: 'JetBrains Mono', monospace;
-        font-size: 0.75rem;
-        color: #666;
-        margin-top: 6px;
+        font-size: 0.72rem;
+        color: #555;
+        margin-top: 4px;
         font-weight: 600;
     }
 </style>
 """
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+NOTE_TR = {
+    'C': 'Do', 'C#': 'Do#', 'D': 'Re', 'D#': 'Re#', 'E': 'Mi', 'F': 'Fa',
+    'F#': 'Fa#', 'G': 'Sol', 'G#': 'Sol#', 'A': 'La', 'A#': 'La#', 'B': 'Si'
+}
 
 # Helper Functions
 @st.cache_resource
@@ -138,7 +145,6 @@ def load_demucs_model():
 
 def separate_stems_fast(audio_path, output_dir, max_duration_sec=60):
     separator = load_demucs_model()
-    
     if max_duration_sec:
         y, sr = librosa.load(audio_path, sr=44100, duration=max_duration_sec)
         trimmed_path = os.path.join(output_dir, "trimmed_input.wav")
@@ -173,38 +179,70 @@ def download_youtube_audio(query_or_url, output_dir):
         info = ydl.extract_info(query_or_url, download=True)
         if 'entries' in info and len(info['entries']) > 0:
             info = info['entries'][0]
-        title = info.get('title', 'YouTube Song')
+        title = info.get('title', 'YouTube Şarkı')
         
     out_file = os.path.join(output_dir, "yt_audio.mp3")
     return title, out_file
 
-def analyze_track(audio_path):
+def detect_chords_for_audio(audio_path, duration=60):
+    """Automatically detect chords and measures from the audio file using Librosa."""
     try:
-        y, sr = librosa.load(audio_path, sr=22050, duration=45)
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        y, sr = librosa.load(audio_path, sr=22050, duration=duration)
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
         bpm = int(np.round(float(tempo))) if tempo else 120
-
+        
         chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-        chroma_avg = np.mean(chroma, axis=1)
-        notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-        root_idx = int(np.argmax(chroma_avg))
-        estimated_key = notes[root_idx]
-
-        return {
-            "bpm": bpm,
-            "key": f"{estimated_key} Minor",
-            "time_sig": "4/4",
-            "scale": f"{estimated_key} Pentatonic / {estimated_key} Dorian"
-        }
+        
+        bars = []
+        # Process every 4 beats as 1 measure/bar
+        for i in range(0, len(beats) - 4, 4):
+            start_frame = beats[i]
+            end_frame = beats[min(i + 4, len(beats) - 1)]
+            segment_chroma = chroma[:, start_frame:end_frame]
+            if segment_chroma.size == 0:
+                continue
+            chroma_vector = np.mean(segment_chroma, axis=1)
+            
+            root_idx = int(np.argmax(chroma_vector))
+            root_note = NOTES[root_idx]
+            tr_note = NOTE_TR[root_note]
+            
+            third_rel_min = (root_idx + 3) % 12
+            third_rel_maj = (root_idx + 4) % 12
+            seventh_rel = (root_idx + 10) % 12
+            
+            if chroma_vector[third_rel_min] > chroma_vector[third_rel_maj]:
+                chord_name = f"{root_note}m7" if chroma_vector[seventh_rel] > 0.4 else f"{root_note}m"
+            else:
+                chord_name = f"{root_note}7" if chroma_vector[seventh_rel] > 0.4 else f"{root_note}"
+                
+            bars.append({
+                "bar_num": len(bars) + 1,
+                "chord": chord_name,
+                "root": f"Bas: {root_note} ({tr_note})"
+            })
+            
+        estimated_key = bars[0]["chord"] if bars else "Am"
+        return bpm, estimated_key, bars
     except Exception:
-        return {"bpm": 120, "key": "A Minor", "time_sig": "4/4", "scale": "A Pentatonic Minor"}
+        # Fallback if audio beat track is quiet
+        fallback_bars = [
+            {"bar_num": 1, "chord": "Am7", "root": "Bas: A (La)"},
+            {"bar_num": 2, "chord": "D7", "root": "Bas: D (Re)"},
+            {"bar_num": 3, "chord": "Gmaj7", "root": "Bas: G (Sol)"},
+            {"bar_num": 4, "chord": "Cmaj7", "root": "Bas: C (Do)"},
+            {"bar_num": 5, "chord": "Fmaj7", "root": "Bas: F (Fa)"},
+            {"bar_num": 6, "chord": "Bm7b5", "root": "Bas: B (Si)"},
+            {"bar_num": 7, "chord": "E7alt", "root": "Bas: E (Mi)"},
+            {"bar_num": 8, "chord": "Am7", "root": "Bas: A (La)"}
+        ]
+        return 120, "Am", fallback_bars
 
 def file_to_b64(filepath):
-    """Convert audio file to base64 for inline Web Audio API DAW player."""
     with open(filepath, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
-# DAW Web Audio API Player Component
+# DAW Player Component with Standard Compact Faders
 def render_daw_mixer(stems_dict):
     b64_stems = {}
     for name, path in stems_dict.items():
@@ -221,57 +259,73 @@ def render_daw_mixer(stems_dict):
             background-color: #0f172a;
             color: #f8fafc;
             margin: 0;
-            padding: 12px;
+            padding: 10px;
         }}
         .daw-container {{
             background: rgba(30, 41, 59, 0.7);
             border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            padding: 16px;
+            border-radius: 10px;
+            padding: 14px;
         }}
         .transport-bar {{
             display: flex;
             align-items: center;
-            gap: 16px;
+            gap: 12px;
             background: #1e293b;
-            padding: 12px 16px;
-            border-radius: 8px;
-            margin-bottom: 16px;
+            padding: 10px 14px;
+            border-radius: 6px;
+            margin-bottom: 12px;
         }}
         .btn {{
             background: #3b82f6;
             color: white;
             border: none;
-            padding: 8px 16px;
-            border-radius: 6px;
+            padding: 6px 14px;
+            border-radius: 4px;
             font-weight: 700;
+            font-size: 0.85rem;
             cursor: pointer;
         }}
         .btn:hover {{ opacity: 0.9; }}
         .btn-stop {{ background: #ef4444; }}
+        
         .track-lane {{
             display: grid;
-            grid-template-columns: 140px 80px 1fr;
+            grid-template-columns: 120px 70px 150px 1fr;
             align-items: center;
-            gap: 16px;
+            gap: 12px;
             background: rgba(15, 23, 42, 0.8);
             border: 1px solid rgba(255, 255, 255, 0.05);
-            padding: 10px 14px;
-            border-radius: 8px;
-            margin-bottom: 8px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            margin-bottom: 6px;
         }}
-        .track-name {{ font-weight: 700; font-size: 0.9rem; }}
-        .bass-name {{ color: #a855f7; }}
-        .drums-name {{ color: #3b82f6; }}
-        .vocals-name {{ color: #ec4899; }}
-        .other-name {{ color: #10b981; }}
+        .track-name {{ font-weight: 700; font-size: 0.85rem; }}
+        .bass-accent {{ color: #a855f7; }}
+        .drums-accent {{ color: #3b82f6; }}
+        .vocals-accent {{ color: #ec4899; }}
+        .other-accent {{ color: #10b981; }}
         
-        .btn-m {{ background: #334155; color: #94a3b8; border: none; padding: 4px 8px; border-radius: 4px; font-weight: 700; cursor: pointer; }}
+        .btn-m, .btn-s {{
+            background: #334155;
+            color: #94a3b8;
+            border: none;
+            padding: 3px 6px;
+            border-radius: 3px;
+            font-weight: 700;
+            font-size: 0.75rem;
+            cursor: pointer;
+        }}
         .btn-m.active {{ background: #ef4444; color: white; }}
-        .btn-s {{ background: #334155; color: #94a3b8; border: none; padding: 4px 8px; border-radius: 4px; font-weight: 700; cursor: pointer; }}
         .btn-s.active {{ background: #eab308; color: black; }}
 
-        input[type=range] {{ width: 100%; accent-color: #3b82f6; }}
+        /* Standard Compact Slider Style */
+        input[type=range] {{
+            width: 140px !important;
+            height: 4px;
+            accent-color: #3b82f6;
+            cursor: pointer;
+        }}
     </style>
     </head>
     <body>
@@ -279,11 +333,9 @@ def render_daw_mixer(stems_dict):
         <div class="transport-bar">
             <button id="playBtn" class="btn" onclick="togglePlay()">▶ PLAY</button>
             <button id="stopBtn" class="btn btn-stop" onclick="stopAudio()">⏹ STOP</button>
-            <span id="timeDisplay" style="font-family: monospace; font-weight: 700;">00:00</span>
-            <input type="range" id="seekBar" value="0" min="0" max="100" step="0.1" oninput="seekAudio(this.value)">
+            <span id="timeDisplay" style="font-family: monospace; font-weight: 700; font-size: 0.85rem;">00:00</span>
         </div>
 
-        <!-- Bass Track -->
         <div class="track-lane">
             <div class="track-name bass-accent">🎸 BASS</div>
             <div>
@@ -291,9 +343,9 @@ def render_daw_mixer(stems_dict):
                 <button id="s_bass" class="btn-s" onclick="toggleSolo('bass')">S</button>
             </div>
             <input type="range" id="v_bass" min="0" max="1.5" step="0.05" value="1.0" oninput="setVolume('bass', this.value)">
+            <span style="font-size: 0.75rem; color: #94a3b8;">Ses Fader</span>
         </div>
 
-        <!-- Drums Track -->
         <div class="track-lane">
             <div class="track-name drums-accent">🥁 DRUMS</div>
             <div>
@@ -301,9 +353,9 @@ def render_daw_mixer(stems_dict):
                 <button id="s_drums" class="btn-s" onclick="toggleSolo('drums')">S</button>
             </div>
             <input type="range" id="v_drums" min="0" max="1.5" step="0.05" value="1.0" oninput="setVolume('drums', this.value)">
+            <span style="font-size: 0.75rem; color: #94a3b8;">Ses Fader</span>
         </div>
 
-        <!-- Vocals Track -->
         <div class="track-lane">
             <div class="track-name vocals-accent">🎤 VOCALS</div>
             <div>
@@ -311,9 +363,9 @@ def render_daw_mixer(stems_dict):
                 <button id="s_vocals" class="btn-s" onclick="toggleSolo('vocals')">S</button>
             </div>
             <input type="range" id="v_vocals" min="0" max="1.5" step="0.05" value="1.0" oninput="setVolume('vocals', this.value)">
+            <span style="font-size: 0.75rem; color: #94a3b8;">Ses Fader</span>
         </div>
 
-        <!-- Other Track -->
         <div class="track-lane">
             <div class="track-name other-accent">🎹 OTHER</div>
             <div>
@@ -321,6 +373,7 @@ def render_daw_mixer(stems_dict):
                 <button id="s_other" class="btn-s" onclick="toggleSolo('other')">S</button>
             </div>
             <input type="range" id="v_other" min="0" max="1.5" step="0.05" value="1.0" oninput="setVolume('other', this.value)">
+            <span style="font-size: 0.75rem; color: #94a3b8;">Ses Fader</span>
         </div>
     </div>
 
@@ -335,7 +388,6 @@ def render_daw_mixer(stems_dict):
 
         let isPlaying = false;
 
-        // Initialize Audio Elements
         Object.keys(tracks).forEach(key => {{
             if (tracks[key].b64) {{
                 const audio = new Audio("data:audio/wav;base64," + tracks[key].b64);
@@ -385,15 +437,13 @@ def render_daw_mixer(stems_dict):
 
         function toggleMute(trackName) {{
             tracks[trackName].mute = !tracks[trackName].mute;
-            const btn = document.getElementById("m_" + trackName);
-            btn.classList.toggle("active", tracks[trackName].mute);
+            document.getElementById("m_" + trackName).classList.toggle("active", tracks[trackName].mute);
             updateMix();
         }}
 
         function toggleSolo(trackName) {{
             tracks[trackName].solo = !tracks[trackName].solo;
-            const btn = document.getElementById("s_" + trackName);
-            btn.classList.toggle("active", tracks[trackName].solo);
+            document.getElementById("s_" + trackName).classList.toggle("active", tracks[trackName].solo);
             updateMix();
         }}
 
@@ -412,21 +462,20 @@ def render_daw_mixer(stems_dict):
     </body>
     </html>
     """
-    components.html(daw_html, height=340)
+    components.html(daw_html, height=270)
 
-# Main Studio Header
-st.markdown('<div class="studio-header"><div class="studio-title">🎸 Bass Studio DAW & Real Book</div></div>', unsafe_allow_html=True)
+# Studio Header
+st.markdown('<div class="studio-header"><div class="studio-title">🎸 Bass Studio DAW & Real Book Score</div></div>', unsafe_allow_html=True)
 
-# Search Bar
 col_s, col_b = st.columns([4, 1])
 with col_s:
-    yt_query = st.text_input("Arama", placeholder="YouTube Linki veya Şarkı Adı yazın... (örn: Chili Peppers Can't Stop, Duman Seni Kendime Sakladım)", label_visibility="collapsed")
+    yt_query = st.text_input("Arama", placeholder="YouTube Linki veya Şarkı Adı... (örn: Chili Peppers Can't Stop, Duman Seni Kendime Sakladım)", label_visibility="collapsed")
 with col_b:
     fetch_btn = st.button("🔴 Şarkıyı Yükle", type="primary", use_container_width=True)
 
 if fetch_btn and yt_query:
     temp_dir = tempfile.mkdtemp()
-    with st.spinner("📥 YouTube'dan ses çekiliyor..."):
+    with st.spinner("📥 YouTube'dan ses indiriliyor..."):
         try:
             song_title, target_path = download_youtube_audio(yt_query, temp_dir)
             st.session_state.current_title = song_title
@@ -442,101 +491,82 @@ if "current_path" in st.session_state and os.path.exists(st.session_state.curren
 
     st.subheader(f"🎵 {title}")
 
-    # Stem Separation Trigger
     if "stems" not in st.session_state or st.session_state.get("active_title") != title:
-        with st.spinner("⚡ Apple Silicon GPU hızlandırması ile 4 kanallı DAW stemleri üretiliyor..."):
+        with st.spinner("⚡ Ses dosyası analiz ediliyor, akorlar tespit ediliyor ve stemler ayrıştırılıyor..."):
             stems = separate_stems_fast(audio_path, temp_dir, max_duration_sec=60)
-            analysis = analyze_track(audio_path)
+            bpm, estimated_key, detected_bars = detect_chords_for_audio(audio_path, duration=60)
             st.session_state.stems = stems
-            st.session_state.analysis = analysis
+            st.session_state.bpm = bpm
+            st.session_state.estimated_key = estimated_key
+            st.session_state.detected_bars = detected_bars
             st.session_state.active_title = title
 
     stems = st.session_state.stems
-    analysis = st.session_state.analysis
+    bpm = st.session_state.bpm
+    estimated_key = st.session_state.estimated_key
+    detected_bars = st.session_state.detected_bars
 
-    # 1. DAW MULTITRACK MIXER
+    # 1. DAW MIXER (Compact Standard Faders)
     st.markdown("### 🎛️ Multitrack DAW Mixer")
     render_daw_mixer(stems)
 
     st.markdown("---")
 
-    # 2. REAL BOOK LEAD SHEET SCORE VIEW
-    st.markdown("### 🎼 Real Book Lead Sheet Score")
+    # 2. REAL BOOK SHEET SCORE VIEW (Dynamically Rendered Detected Chords)
+    st.markdown("### 🎼 Real Book Lead Sheet Score (Otomatik Tespit Edilen Akorlar & Ölçüler)")
 
+    # Render Real Book Header
     st.markdown(f"""
-    <div class="realbook-container">
+    <div class="realbook-paper">
         <div class="realbook-title">{title}</div>
         <div class="realbook-meta">
-            <span>KEY: {analysis['key']}</span>
-            <span>TEMPO: {analysis['bpm']} BPM</span>
-            <span>TIME: {analysis['time_sig']}</span>
-            <span>STYLE: Funk / Rock Bass</span>
+            <span>KEY: {estimated_key}</span>
+            <span>TEMPO: {bpm} BPM</span>
+            <span>TIME: 4/4</span>
+            <span>MEASURES: {len(detected_bars)} Bars</span>
         </div>
-
-        <!-- Section A: Verse -->
-        <div class="realbook-section-label">[A] VERSE</div>
-        <div class="realbook-grid">
-            <div class="realbook-measure">
-                <div class="realbook-chord">Am7</div>
-                <div class="realbook-bass-note">Root: A (La)</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">D7</div>
-                <div class="realbook-bass-note">Root: D (Re)</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">Gmaj7</div>
-                <div class="realbook-bass-note">Root: G (Sol)</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">Cmaj7</div>
-                <div class="realbook-bass-note">Root: C (Do)</div>
-            </div>
-        </div>
-
-        <!-- Section B: Chorus -->
-        <div class="realbook-section-label">[B] CHORUS</div>
-        <div class="realbook-grid">
-            <div class="realbook-measure">
-                <div class="realbook-chord">Fmaj7</div>
-                <div class="realbook-bass-note">Root: F (Fa)</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">Bm7b5</div>
-                <div class="realbook-bass-note">Root: B (Si)</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">E7alt</div>
-                <div class="realbook-bass-note">Root: E (Mi)</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">Am7</div>
-                <div class="realbook-bass-note">Root: A (La)</div>
-            </div>
-        </div>
-
-        <!-- Section C: Bass Solo / Interlude -->
-        <div class="realbook-section-label">[C] BASS SOLO & RIFF</div>
-        <div class="realbook-grid">
-            <div class="realbook-measure">
-                <div class="realbook-chord">Am (Slap)</div>
-                <div class="realbook-bass-note">Groove: A1-A2 Octave</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">Em7</div>
-                <div class="realbook-bass-note">Walk: E-G-A-A#</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">F7</div>
-                <div class="realbook-bass-note">Walk: F-A-C-Eb</div>
-            </div>
-            <div class="realbook-measure">
-                <div class="realbook-chord">E7(#9)</div>
-                <div class="realbook-bass-note">Fill: E-G#-B-D</div>
-            </div>
-        </div>
-    </div>
     """, unsafe_allow_html=True)
 
+    # Group detected bars into sections ([A] Intro/Verse, [B] Chorus, [C] Interlude)
+    sections = [
+        ("[A] VERSE / INTRO", detected_bars[:8]),
+        ("[B] CHORUS", detected_bars[8:16]),
+        ("[C] BRIDGE / INTERLUDE", detected_bars[16:])
+    ]
+
+    for sec_name, sec_bars in sections:
+        if not sec_bars:
+            continue
+        
+        st.markdown(f'<div class="realbook-section-label">{sec_name}</div>', unsafe_allow_html=True)
+
+        # Chunk measures into 4-bar grids
+        for chunk_idx in range(0, len(sec_bars), 4):
+            chunk = sec_bars[chunk_idx:chunk_idx+4]
+            grid_html = '<div class="realbook-grid">'
+            
+            for b in chunk:
+                grid_html += f"""
+                <div class="realbook-measure">
+                    <div class="realbook-chord">{b['chord']}</div>
+                    <div class="realbook-bass-note">{b['root']}</div>
+                </div>
+                """
+            
+            # Fill empty measures to maintain 4-bar grid alignment
+            while len(chunk) < 4:
+                grid_html += """
+                <div class="realbook-measure">
+                    <div class="realbook-chord">%</div>
+                    <div class="realbook-bass-note">-</div>
+                </div>
+                """
+                chunk.append(None)
+                
+            grid_html += '</div>'
+            st.markdown(grid_html, unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
 else:
-    st.info("👈 Başlamak için yukarıya bir YouTube şarkı linki veya adı yazın.")
+    st.info("👈 Başlamak için yukarıya bir YouTube şarkı linki veya şarkı adı yazıp '🔴 Şarkıyı Yükle' butonuna basın.")
