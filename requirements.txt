@@ -10,3 +10,6 @@ requests>=2.31.0
 yt-dlp>=2026.8.19
 essentia>=2.1b6.dev1000
 audio-separator[cpu]>=0.47.0
+basic-pitch>=0.4.0
+music21>=10.5.0
+setuptools<81

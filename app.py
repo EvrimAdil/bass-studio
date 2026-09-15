@@ -24,6 +24,11 @@ try:
 except Exception:
     UVRSeparator = None
 
+try:
+    from basic_pitch.inference import predict as basic_pitch_predict
+except Exception:
+    basic_pitch_predict = None
+
 st.set_page_config(page_title="Bass Studio", page_icon="🎸", layout="wide", initial_sidebar_state="collapsed")
 
 NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -255,18 +260,99 @@ def essentia_chords(audio_path: str, duration: int | None, bpm_fallback: int):
         return None
 
 
-def detect_chords_for_audio(audio_path: str, duration: int | None = 120, engine: str = "Essentia + Librosa ensemble"):
+
+def estimate_tempo_beats(audio_path: str, duration: int | None):
     y, sr = librosa.load(audio_path, sr=22050, duration=duration, mono=True)
-    y_harm, _ = librosa.effects.hpss(y)
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr, trim=False)
     tempo_arr = np.asarray(tempo).reshape(-1)
     bpm = int(np.round(float(tempo_arr[0]))) if tempo_arr.size else 120
     if bpm <= 0:
         bpm = 120
     if len(beats) < 8:
-        step = max(1, int((60 / bpm) * sr / 512))
-        beats = librosa.samples_to_frames(librosa.frames_to_samples(librosa.util.fix_frames(np.arange(0, len(y) // 512, step))))
+        hop = 512
+        step = max(1, int((60 / bpm) * sr / hop))
+        beats = np.arange(0, max(1, len(y) // hop), step)
     beat_times = librosa.frames_to_time(beats, sr=sr)
+    return y, sr, bpm, beats, beat_times
+
+
+def bars_from_beat_times(beat_times, bpm: int, audio_len_sec: float | None = None):
+    bars = []
+    if len(beat_times) >= 5:
+        for i in range(0, len(beat_times) - 4, 4):
+            start_t = float(beat_times[i])
+            end_t = float(beat_times[min(i + 4, len(beat_times) - 1)])
+            if end_t > start_t:
+                bars.append((start_t, end_t))
+    if not bars:
+        bar_len = 4 * 60 / max(bpm, 1)
+        total = audio_len_sec or bar_len * 8
+        count = max(1, int(np.ceil(total / bar_len)))
+        bars = [(i * bar_len, min((i + 1) * bar_len, total)) for i in range(count)]
+    return bars
+
+
+def normalize_note_chord(chord: str):
+    chord = normalize_chord_name(chord)
+    return chord.replace(":maj", "").replace(":min", "m")
+
+
+def basic_pitch_chords(audio_path: str, duration: int | None, bpm: int, beat_times):
+    if basic_pitch_predict is None:
+        return None
+    try:
+        source = trim_audio(audio_path, tempfile.mkdtemp(prefix="basic-pitch-preview-"), duration) if duration else audio_path
+        _, _, note_events = basic_pitch_predict(source)
+        try:
+            audio_len_sec = librosa.get_duration(path=source)
+        except Exception:
+            audio_len_sec = None
+        bar_times = bars_from_beat_times(beat_times, bpm, audio_len_sec)
+        bars = []
+        for idx, (start_t, end_t) in enumerate(bar_times, start=1):
+            vec = np.zeros(12)
+            for ev in note_events:
+                # Basic Pitch event tuple: start, end, midi_pitch, amplitude, pitch_bends
+                n_start, n_end, midi_pitch = float(ev[0]), float(ev[1]), int(ev[2])
+                amp = float(ev[3]) if len(ev) > 3 and ev[3] is not None else 1.0
+                overlap = max(0.0, min(end_t, n_end) - max(start_t, n_start))
+                if overlap <= 0:
+                    continue
+                pc = midi_pitch % 12
+                # Down-weight very high melody notes a little; bass/mid notes are better chord evidence.
+                octave_weight = 1.15 if midi_pitch < 60 else (0.92 if midi_pitch > 76 else 1.0)
+                vec[pc] += overlap * max(amp, 0.05) * octave_weight
+            chord, root, conf = detect_chord_name(vec)
+            if np.sum(vec) <= 1e-6:
+                chord, root, conf = "N.C.", "-", 0.0
+            bars.append({"bar_num": idx, "chord": chord, "root": root, "confidence": round(float(conf), 2), "start": round(start_t, 3), "end": round(end_t, 3), "source": "basic-pitch-midi"})
+        return bars, note_events
+    except Exception as exc:
+        st.warning(f"Basic Pitch modeli çalışmadı, fallback kullanılacak: {exc}")
+        return None
+
+
+def infer_key_from_bars(bars: list[dict]):
+    for b in bars:
+        c = b.get("chord", "N.C.")
+        if c != "N.C.":
+            key = c
+            for suffix in ("maj7", "m7", "dim", "sus4", "7", "m6", "6", "m"):
+                if key.endswith(suffix):
+                    return key[: -len(suffix)] + ("m" if suffix in ("m", "m7", "m6") else "")
+            return key
+    return "C"
+
+
+def detect_chords_for_audio(audio_path: str, duration: int | None = 120, engine: str = "Basic Pitch MIDI + Music21"):
+    y, sr, bpm, beats, beat_times = estimate_tempo_beats(audio_path, duration)
+    if engine.startswith("Basic Pitch"):
+        bp = basic_pitch_chords(audio_path, duration, bpm, beat_times)
+        if bp is not None:
+            bars, note_events = bp
+            key = infer_key_from_bars(bars)
+            return bpm, key, bars
+    y_harm, _ = librosa.effects.hpss(y)
     chroma_cqt = librosa.feature.chroma_cqt(y=y_harm, sr=sr, bins_per_octave=36)
     chroma_cens = librosa.feature.chroma_cens(y=y_harm, sr=sr)
     essentia_data = essentia_chords(audio_path, duration, bpm) if engine.startswith("Essentia") else None
@@ -355,13 +441,12 @@ import WaveSurfer from 'https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.esm.js
 import RegionsPlugin from 'https://unpkg.com/wavesurfer.js@7/dist/plugins/regions.esm.js';
 window.WaveSurfer = WaveSurfer; window.RegionsPlugin = RegionsPlugin;
 </script>
-<script src="https://cdn.jsdelivr.net/npm/abcjs@6.7.0/dist/abcjs-basic-min.js"></script>
 <style>
 *{box-sizing:border-box} body{margin:0;background:transparent;color:#e5e7eb;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}.shell{background:linear-gradient(180deg,#101827,#090d17);border:1px solid rgba(255,255,255,.09);border-radius:22px;padding:10px;box-shadow:0 20px 70px rgba(0,0,0,.32)}.top{display:grid;grid-template-columns:auto auto auto 1fr auto auto;align-items:center;gap:8px;margin-bottom:10px}.play{width:44px;height:44px;border-radius:50%;border:0;background:linear-gradient(135deg,#7c3aed,#06b6d4);color:white;font-size:17px;font-weight:900;cursor:pointer}.btn{height:32px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.06);color:#dbeafe;font-weight:850;font-size:12px;cursor:pointer}.btn.active{background:#22d3ee;color:#06111c}.title{font-weight:850;letter-spacing:-.03em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-left:5px}.time{font:800 12px ui-monospace,Menlo,monospace;color:#9ca3af}.speed,.master{height:32px;border-radius:10px;background:#111827;color:#e5e7eb;border:1px solid rgba(255,255,255,.1);font-weight:750}.master{width:96px;accent-color:#22d3ee}.wave-card{position:relative;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);border-radius:14px;padding:7px 10px;margin-bottom:6px}.hint{font:700 11px ui-monospace,Menlo,monospace;color:#94a3b8;margin-top:5px}.mixer{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:6px 0 8px}.track{display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;padding:8px;border-radius:13px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.065)}.track-name{font-weight:850;font-size:13px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tog{height:24px;width:28px;border:0;border-radius:7px;background:#1f2937;color:#9ca3af;font-weight:900;font-size:11px;cursor:pointer}.tog.m.active{background:#ef4444;color:white}.tog.s.active{background:#facc15;color:#111827}.vol{grid-column:1/4;width:100%;accent-color:var(--c);height:4px}.score{position:relative;background:#fffdf6;color:#111827;border-radius:18px;border:1px solid #d7cfbd;padding:18px;min-height:880px;max-height:none;overflow:visible}.score-head{display:flex;justify-content:space-between;align-items:center;font:800 11px ui-monospace,Menlo,monospace;color:#746b5a;margin-bottom:8px}.bargrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}.barcell{position:relative;border:1px solid #ded6c4;border-radius:12px;padding:14px 10px;text-align:center;background:#fffaf0;transition:.12s;min-height:108px;display:flex;flex-direction:column;justify-content:center}.barcell.active{background:#dbeafe;border-color:#2563eb;box-shadow:inset 0 0 0 2px #2563eb}.barcell.active:before{content:"";position:absolute;top:-7px;bottom:-7px;left:50%;width:2px;background:#ef4444}.barno{font:800 12px ui-monospace,Menlo,monospace;color:#8a806c}.ch{font-size:34px;font-weight:950;color:#111827;line-height:1.05}.rt{font-size:12px;color:#6b7280;margin-top:4px}.conf{font-size:10px;color:#9ca3af;margin-top:4px}.long-note{font:800 13px ui-monospace,Menlo,monospace;color:#746b5a;margin-bottom:8px}.presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}@media(max-width:820px){.top{grid-template-columns:auto auto auto 1fr}.mixer{grid-template-columns:1fr 1fr}.bargrid{grid-template-columns:repeat(2,1fr)}.master,.speed{width:80px}.title{grid-column:1/5}}
-</style></head><body><div class="shell"><div class="top"><button id="play" class="play">▶</button><button class="btn" onclick="jump(-10)">↶10</button><button class="btn" onclick="jump(10)">10↷</button><div class="title" id="songTitle"></div><select id="speed" class="speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option></select><input id="master" class="master" title="Master" type="range" min="0" max="1" step="0.01" value="1"><div class="time"><span id="cur">00:00</span> / <span id="dur">00:00</span></div></div><div class="wave-card"><div id="wave"></div><div class="presets"><button id="loopBtn" class="btn">Loop off</button><button class="btn" onclick="clearLoop()">Loop temizle</button><button class="btn" onclick="preset('groove')">Bass+Drums</button><button class="btn" onclick="preset('backing')">Backing</button><button class="btn" onclick="preset('all')">All</button></div><div class="hint">Loop için waveform üzerinde sürükleyip bölge seç. Bölgeyi tutup taşıyabilir, kenarlardan uzatabilirsin.</div></div><div id="mixer" class="mixer"></div><div class="score"><div class="score-head"><span>abcjs notation + aktif ölçü takibi</span><span id="barStatus">bar -</span></div><div id="score"></div><div id="bargrid" class="bargrid"></div></div></div>
+</style></head><body><div class="shell"><div class="top"><button id="play" class="play">▶</button><button class="btn" onclick="jump(-10)">↶10</button><button class="btn" onclick="jump(10)">10↷</button><div class="title" id="songTitle"></div><select id="speed" class="speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option></select><input id="master" class="master" title="Master" type="range" min="0" max="1" step="0.01" value="1"><div class="time"><span id="cur">00:00</span> / <span id="dur">00:00</span></div></div><div class="wave-card"><div id="wave"></div><div class="presets"><button id="loopBtn" class="btn">Loop off</button><button class="btn" onclick="clearLoop()">Loop temizle</button><button class="btn" onclick="preset('groove')">Bass+Drums</button><button class="btn" onclick="preset('backing')">Backing</button><button class="btn" onclick="preset('all')">All</button></div><div class="hint">Loop için waveform üzerinde sürükleyip bölge seç. Bölgeyi tutup taşıyabilir, kenarlardan uzatabilirsin.</div></div><div id="mixer" class="mixer"></div><div class="score"><div class="score-head"><span>AI chord map + aktif ölçü takibi</span><span id="barStatus">bar -</span></div><div id="score"></div><div id="bargrid" class="bargrid"></div></div></div>
 <script type="module">
 const DATA = __DATA__;
-function waitForLibs(){return new Promise(r=>{const t=setInterval(()=>{if(window.WaveSurfer&&window.RegionsPlugin&&window.ABCJS){clearInterval(t);r()}},30)})}
+function waitForLibs(){return new Promise(r=>{const t=setInterval(()=>{if(window.WaveSurfer&&window.RegionsPlugin){clearInterval(t);r()}},30)})}
 await waitForLibs();
 const $=id=>document.getElementById(id); $('songTitle').textContent=DATA.title;
 const fmt=t=>{if(!isFinite(t))return'00:00';let m=Math.floor(t/60),s=Math.floor(t%60);return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')};
@@ -384,7 +469,7 @@ function syncStemTime(time){Object.values(tracks).forEach(t=>{if(Math.abs(t.audi
 window.jump=s=>seekAll(Math.max(0, Math.min(ws.getDuration(), ws.getCurrentTime()+s)), ws.isPlaying());
 window.preset=name=>{Object.keys(tracks).forEach(id=>{tracks[id].mute=false;tracks[id].solo=false;$(`m_${id}`).classList.remove('active');$(`s_${id}`).classList.remove('active')}); if(name==='groove'){['bass','drums'].forEach(id=>{if(tracks[id]){tracks[id].solo=true;$(`s_${id}`).classList.add('active')}})} if(name==='backing'&&tracks.bass){tracks.bass.mute=true;$('m_bass').classList.add('active')} applyMix();};
 buildMixer(); applyMix();
-if (DATA.bars.length <= 32) { ABCJS.renderAbc('score', DATA.abc, {responsive:'resize', staffwidth:980, paddingtop:0, paddingbottom:0}); } else { $('score').innerHTML = '<div class=\"long-note\">Uzun parçada performans için staff çizimi kapalı; tam sayfa chord sheet aktif.</div>'; }
+$('score').innerHTML = '<div class=\"long-note\">Yeni çıktı: abcjs nota yerine model tabanlı Real Book chord map. Ölçüye tıkla: player o ölçüye gider.</div>';
 const grid=$('bargrid'); DATA.bars.forEach(b=>{const d=document.createElement('div'); d.className='barcell'; d.id='bar_'+b.bar_num; d.onclick=()=>seekAll(b.start, ws.isPlaying()); d.innerHTML=`<div class="barno">${b.bar_num}</div><div class="ch">${String(b.chord).replaceAll('#','♯')}</div><div class="rt">${b.root}</div><div class="conf">${b.source||''} ${Math.round((b.confidence||0)*100)}%</div>`; grid.appendChild(d)});
 let lastBar=null; function updateBar(t){let b=DATA.bars.find(x=>t>=x.start&&t<x.end)||DATA.bars[DATA.bars.length-1]; if(!b||b.bar_num===lastBar)return; if(lastBar)$('bar_'+lastBar)?.classList.remove('active'); lastBar=b.bar_num; $('bar_'+lastBar)?.classList.add('active'); $('bar_'+lastBar)?.scrollIntoView({block:'center',inline:'nearest',behavior:'smooth'}); $('barStatus').textContent=`bar ${b.bar_num} • ${b.chord}`;}
 </script></body></html>
@@ -392,7 +477,7 @@ let lastBar=null; function updateBar(t){let b=DATA.bars.find(x=>t>=x.start&&t<x.
     components.html(html_doc, height=1280, scrolling=True)
 
 
-st.markdown("<div class='app-hero'><div class='brand'>🎸 <span>Bass Studio</span></div><div class='pill'>wavesurfer loop • compact mixer • synced notation</div></div>", unsafe_allow_html=True)
+st.markdown("<div class='app-hero'><div class='brand'>🎸 <span>Bass Studio</span></div><div class='pill'>wavesurfer loop • AI chord map • compact mixer</div></div>", unsafe_allow_html=True)
 
 with st.container():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -404,7 +489,7 @@ with st.container():
     with c3:
         scope = st.selectbox("Süre", ["İlk 90 sn", "İlk 180 sn", "Tam şarkı"], label_visibility="collapsed")
     with c4:
-        chord_engine = st.selectbox("Akor", ["Essentia + Librosa ensemble", "Librosa ensemble"], label_visibility="collapsed")
+        chord_engine = st.selectbox("Akor", ["Basic Pitch MIDI + Music21", "Essentia + Librosa ensemble", "Librosa ensemble"], label_visibility="collapsed")
     with c5:
         run = st.button("Yükle", type="primary", use_container_width=True)
     st.markdown("<div class='small-note'>Öneri: önce Kaliteli pratik + İlk 90 sn. UVR deneysel mod ilk kullanımda model indirebilir ve uzun sürebilir.</div>", unsafe_allow_html=True)
@@ -449,7 +534,7 @@ if "current_path" in st.session_state and os.path.exists(st.session_state.curren
     m4.metric("Ölçü", f"{len(st.session_state.bars)} bars")
     render_practice_workspace(st.session_state.work_audio, st.session_state.stems, title, st.session_state.abc, st.session_state.bars, st.session_state.bpm)
     with st.expander("Teknik çıktı / tespit edilen akorlar"):
-        st.code(st.session_state.abc, language="abc")
+        st.code(st.session_state.abc, language="text")
         st.json(st.session_state.bars[:64])
 else:
     st.info("Bir şarkı adı veya YouTube linki girip Yükle'ye basın.")
