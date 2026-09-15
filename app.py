@@ -1,5 +1,6 @@
 import os
 import time
+import base64
 import tempfile
 import torch
 import numpy as np
@@ -7,55 +8,123 @@ import librosa
 import soundfile as sf
 import yt_dlp
 import streamlit as st
+import streamlit.components.v1 as components
 import demucs.api
 
-# Page Setup
+# Page Config
 st.set_page_config(
-    page_title="Bass Studio | Ultra Hızlı Bas Gitar İstasyonu",
+    page_title="Bass Studio DAW & Real Book",
     page_icon="🎸",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
+# Minimalist Studio & Real Book CSS
 CUSTOM_CSS = """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&family=JetBrains+Mono:wght@500;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=JetBrains+Mono:wght@500;700&family=Plus+Jakarta+Sans:wght@400;600;700&display=swap');
 
-    html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', sans-serif; }
-    .main .block-container { padding-top: 1.8rem; padding-bottom: 3rem; }
+    html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #0b0f19; }
+    .main .block-container { max-width: 1000px !important; padding-top: 1.2rem; padding-bottom: 3rem; }
+    #MainMenu, footer, header { visibility: hidden; }
 
+    /* Title Styling */
+    .studio-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+        padding-bottom: 12px;
+        margin-bottom: 16px;
+    }
     .studio-title {
-        font-size: 2.2rem;
+        font-size: 1.6rem;
         font-weight: 800;
-        background: linear-gradient(135deg, #a855f7 0%, #ec4899 50%, #3b82f6 100%);
+        letter-spacing: -0.02em;
+        background: linear-gradient(135deg, #a855f7 0%, #3b82f6 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        margin-bottom: 0.2rem;
     }
-    
-    .studio-sub { color: #94a3b8; font-size: 0.95rem; margin-bottom: 1.5rem; }
 
-    .stem-card {
-        background: rgba(30, 41, 59, 0.6);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 12px;
-        padding: 16px;
-        margin-bottom: 12px;
+    /* REAL BOOK SHEET SCORE STYLING */
+    .realbook-container {
+        background: #fdfbf7;
+        color: #1a1a1a;
+        border: 2px solid #2d2d2d;
+        border-radius: 8px;
+        padding: 24px;
+        font-family: 'Caveat', cursive, serif;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+        margin-top: 1.5rem;
     }
-    .stem-title { font-size: 1rem; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-    .bass-accent { color: #a855f7; }
-    .drums-accent { color: #3b82f6; }
-    .vocals-accent { color: #ec4899; }
-    .other-accent { color: #10b981; }
 
-    .traffic-pill {
-        display: inline-block; font-size: 0.8rem; font-weight: 700;
-        padding: 4px 12px; border-radius: 20px; margin-right: 8px; margin-bottom: 8px;
+    .realbook-title {
+        font-size: 2.4rem;
+        font-weight: 700;
+        text-align: center;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        margin-bottom: 4px;
+        border-bottom: 2px solid #1a1a1a;
+        padding-bottom: 6px;
     }
-    .chord-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 10px; margin-top: 10px; }
-    .chord-box { background: rgba(15, 23, 42, 0.8); border: 1px solid #334155; border-radius: 8px; padding: 12px; text-align: center; }
-    .chord-name { font-family: 'JetBrains Mono', monospace; font-size: 1.2rem; font-weight: 700; color: #f8fafc; }
-    .bass-root { font-size: 0.75rem; color: #a855f7; margin-top: 2px; }
+
+    .realbook-meta {
+        display: flex;
+        justify-content: space-between;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.85rem;
+        font-weight: 700;
+        margin-bottom: 18px;
+        color: #333;
+    }
+
+    .realbook-section-label {
+        font-size: 1.6rem;
+        font-weight: 700;
+        background: #1a1a1a;
+        color: #fdfbf7;
+        padding: 2px 10px;
+        border-radius: 4px;
+        display: inline-block;
+        margin-top: 14px;
+        margin-bottom: 10px;
+    }
+
+    .realbook-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        border: 2px solid #1a1a1a;
+        background: #fdfbf7;
+        margin-bottom: 16px;
+    }
+
+    .realbook-measure {
+        border-right: 2px solid #1a1a1a;
+        padding: 12px 8px;
+        text-align: center;
+        min-height: 70px;
+        position: relative;
+    }
+
+    .realbook-measure:last-child {
+        border-right: none;
+    }
+
+    .realbook-chord {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #000;
+        line-height: 1;
+    }
+
+    .realbook-bass-note {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.75rem;
+        color: #666;
+        margin-top: 6px;
+        font-weight: 600;
+    }
 </style>
 """
 
@@ -64,16 +133,12 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # Helper Functions
 @st.cache_resource
 def load_demucs_model():
-    """Load Demucs model on Apple Silicon MPS/GPU acceleration."""
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-    # Use htdemucs with 1 shift for maximum speed
     return demucs.api.Separator(model='htdemucs', device=device, shifts=1)
 
-def separate_stems_fast(audio_path, output_dir, max_duration_sec=None):
-    """Separate audio into 4 stems with fast mode support."""
+def separate_stems_fast(audio_path, output_dir, max_duration_sec=60):
     separator = load_demucs_model()
     
-    # Optional audio trimming for ultra-fast processing
     if max_duration_sec:
         y, sr = librosa.load(audio_path, sr=44100, duration=max_duration_sec)
         trimmed_path = os.path.join(output_dir, "trimmed_input.wav")
@@ -91,7 +156,6 @@ def separate_stems_fast(audio_path, output_dir, max_duration_sec=None):
     return stem_paths
 
 def download_youtube_audio(query_or_url, output_dir):
-    """Fast audio downloader via yt-dlp."""
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': os.path.join(output_dir, 'yt_audio.%(ext)s'),
@@ -109,13 +173,12 @@ def download_youtube_audio(query_or_url, output_dir):
         info = ydl.extract_info(query_or_url, download=True)
         if 'entries' in info and len(info['entries']) > 0:
             info = info['entries'][0]
-        title = info.get('title', 'YouTube Şarkı')
+        title = info.get('title', 'YouTube Song')
         
     out_file = os.path.join(output_dir, "yt_audio.mp3")
     return title, out_file
 
-def analyze_key_and_chords(audio_path):
-    """Fast Key & BPM estimation."""
+def analyze_track(audio_path):
     try:
         y, sr = librosa.load(audio_path, sr=22050, duration=45)
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
@@ -129,142 +192,351 @@ def analyze_key_and_chords(audio_path):
 
         return {
             "bpm": bpm,
-            "key": f"{estimated_key} Minor / Major",
-            "suggested_scales": f"{estimated_key} Pentatonic Minor, {estimated_key} Dorian / Natural Minor"
+            "key": f"{estimated_key} Minor",
+            "time_sig": "4/4",
+            "scale": f"{estimated_key} Pentatonic / {estimated_key} Dorian"
         }
     except Exception:
-        return {"bpm": 120, "key": "A Minor", "suggested_scales": "A Pentatonic Minor, A Dorian"}
+        return {"bpm": 120, "key": "A Minor", "time_sig": "4/4", "scale": "A Pentatonic Minor"}
 
-# Header
-st.markdown('<div class="studio-title">🎸 Bass Studio</div>', unsafe_allow_html=True)
-st.markdown('<div class="studio-sub">Hızlı YouTube Arama ➔ Apple Silicon GPU Hızlandırmalı AI Bas & Ritim İzolasyonu</div>', unsafe_allow_html=True)
+def file_to_b64(filepath):
+    """Convert audio file to base64 for inline Web Audio API DAW player."""
+    with open(filepath, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
-# Sidebar Options
-st.sidebar.title("⚡ Hız & Çalışma Modu")
+# DAW Web Audio API Player Component
+def render_daw_mixer(stems_dict):
+    b64_stems = {}
+    for name, path in stems_dict.items():
+        if os.path.exists(path):
+            b64_stems[name] = file_to_b64(path)
 
-process_mode = st.sidebar.radio(
-    "Ayrıştırma Hızı Seçimi",
-    ["⚡ 1 Dakikalık Hızlı Önizleme (3 Saniyede Hazır)", "🐢 Tüm Şarkı Modu (Tam Süre)"]
-)
+    daw_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            margin: 0;
+            padding: 12px;
+        }}
+        .daw-container {{
+            background: rgba(30, 41, 59, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 16px;
+        }}
+        .transport-bar {{
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            background: #1e293b;
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }}
+        .btn {{
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: 700;
+            cursor: pointer;
+        }}
+        .btn:hover {{ opacity: 0.9; }}
+        .btn-stop {{ background: #ef4444; }}
+        .track-lane {{
+            display: grid;
+            grid-template-columns: 140px 80px 1fr;
+            align-items: center;
+            gap: 16px;
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 10px 14px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }}
+        .track-name {{ font-weight: 700; font-size: 0.9rem; }}
+        .bass-name {{ color: #a855f7; }}
+        .drums-name {{ color: #3b82f6; }}
+        .vocals-name {{ color: #ec4899; }}
+        .other-name {{ color: #10b981; }}
+        
+        .btn-m {{ background: #334155; color: #94a3b8; border: none; padding: 4px 8px; border-radius: 4px; font-weight: 700; cursor: pointer; }}
+        .btn-m.active {{ background: #ef4444; color: white; }}
+        .btn-s {{ background: #334155; color: #94a3b8; border: none; padding: 4px 8px; border-radius: 4px; font-weight: 700; cursor: pointer; }}
+        .btn-s.active {{ background: #eab308; color: black; }}
 
-st.sidebar.markdown("---")
-st.sidebar.info("💡 **Hız İpucu:** '1 Dakikalık Hızlı Önizleme' modu şarkının ana bas ve ritim bölümünü 3-5 saniyede ayrıştırır. Ana temayı hemen öğrenmek için idealdir!")
+        input[type=range] {{ width: 100%; accent-color: #3b82f6; }}
+    </style>
+    </head>
+    <body>
+    <div class="daw-container">
+        <div class="transport-bar">
+            <button id="playBtn" class="btn" onclick="togglePlay()">▶ PLAY</button>
+            <button id="stopBtn" class="btn btn-stop" onclick="stopAudio()">⏹ STOP</button>
+            <span id="timeDisplay" style="font-family: monospace; font-weight: 700;">00:00</span>
+            <input type="range" id="seekBar" value="0" min="0" max="100" step="0.1" oninput="seekAudio(this.value)">
+        </div>
 
-# Input Section
-col_search, col_btn = st.columns([3, 1])
-with col_search:
-    yt_query = st.text_input("YouTube Arama / Link", placeholder="Örn: Chili Peppers Can't Stop, Duman Seni Kendime Sakladım...", label_visibility="collapsed")
-with col_btn:
-    fetch_btn = st.button("🔴 Şarkıyı Çek & Ayrıştır", type="primary", use_container_width=True)
+        <!-- Bass Track -->
+        <div class="track-lane">
+            <div class="track-name bass-accent">🎸 BASS</div>
+            <div>
+                <button id="m_bass" class="btn-m" onclick="toggleMute('bass')">M</button>
+                <button id="s_bass" class="btn-s" onclick="toggleSolo('bass')">S</button>
+            </div>
+            <input type="range" id="v_bass" min="0" max="1.5" step="0.05" value="1.0" oninput="setVolume('bass', this.value)">
+        </div>
 
-with st.expander("📁 İsteğe Bağlı: Bilgisayarımdan MP3/WAV Dosyası Yükle", expanded=False):
-    uploaded_file = st.file_uploader("Yerel Ses Dosyası", type=["mp3", "wav", "m4a"])
+        <!-- Drums Track -->
+        <div class="track-lane">
+            <div class="track-name drums-accent">🥁 DRUMS</div>
+            <div>
+                <button id="m_drums" class="btn-m" onclick="toggleMute('drums')">M</button>
+                <button id="s_drums" class="btn-s" onclick="toggleSolo('drums')">S</button>
+            </div>
+            <input type="range" id="v_drums" min="0" max="1.5" step="0.05" value="1.0" oninput="setVolume('drums', this.value)">
+        </div>
+
+        <!-- Vocals Track -->
+        <div class="track-lane">
+            <div class="track-name vocals-accent">🎤 VOCALS</div>
+            <div>
+                <button id="m_vocals" class="btn-m" onclick="toggleMute('vocals')">M</button>
+                <button id="s_vocals" class="btn-s" onclick="toggleSolo('vocals')">S</button>
+            </div>
+            <input type="range" id="v_vocals" min="0" max="1.5" step="0.05" value="1.0" oninput="setVolume('vocals', this.value)">
+        </div>
+
+        <!-- Other Track -->
+        <div class="track-lane">
+            <div class="track-name other-accent">🎹 OTHER</div>
+            <div>
+                <button id="m_other" class="btn-m" onclick="toggleMute('other')">M</button>
+                <button id="s_other" class="btn-s" onclick="toggleSolo('other')">S</button>
+            </div>
+            <input type="range" id="v_other" min="0" max="1.5" step="0.05" value="1.0" oninput="setVolume('other', this.value)">
+        </div>
+    </div>
+
+    <script>
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const tracks = {{
+            bass: {{ b64: "{b64_stems.get('bass', '')}", gainNode: null, audio: null, mute: false, solo: false }},
+            drums: {{ b64: "{b64_stems.get('drums', '')}", gainNode: null, audio: null, mute: false, solo: false }},
+            vocals: {{ b64: "{b64_stems.get('vocals', '')}", gainNode: null, audio: null, mute: false, solo: false }},
+            other: {{ b64: "{b64_stems.get('other', '')}", gainNode: null, audio: null, mute: false, solo: false }}
+        }};
+
+        let isPlaying = false;
+
+        // Initialize Audio Elements
+        Object.keys(tracks).forEach(key => {{
+            if (tracks[key].b64) {{
+                const audio = new Audio("data:audio/wav;base64," + tracks[key].b64);
+                const source = audioCtx.createMediaElementSource(audio);
+                const gainNode = audioCtx.createGain();
+                source.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                tracks[key].audio = audio;
+                tracks[key].gainNode = gainNode;
+            }}
+        }});
+
+        function togglePlay() {{
+            if (audioCtx.state === 'suspended') {{ audioCtx.resume(); }}
+            const btn = document.getElementById("playBtn");
+            if (!isPlaying) {{
+                Object.keys(tracks).forEach(key => {{
+                    if (tracks[key].audio) tracks[key].audio.play();
+                }});
+                isPlaying = true;
+                btn.innerText = "⏸ PAUSE";
+            }} else {{
+                Object.keys(tracks).forEach(key => {{
+                    if (tracks[key].audio) tracks[key].audio.pause();
+                }});
+                isPlaying = false;
+                btn.innerText = "▶ PLAY";
+            }}
+        }}
+
+        function stopAudio() {{
+            Object.keys(tracks).forEach(key => {{
+                if (tracks[key].audio) {{
+                    tracks[key].audio.pause();
+                    tracks[key].audio.currentTime = 0;
+                }}
+            }});
+            isPlaying = false;
+            document.getElementById("playBtn").innerText = "▶ PLAY";
+        }}
+
+        function setVolume(trackName, val) {{
+            if (tracks[trackName] && tracks[trackName].gainNode) {{
+                tracks[trackName].gainNode.gain.value = parseFloat(val);
+            }}
+        }}
+
+        function toggleMute(trackName) {{
+            tracks[trackName].mute = !tracks[trackName].mute;
+            const btn = document.getElementById("m_" + trackName);
+            btn.classList.toggle("active", tracks[trackName].mute);
+            updateMix();
+        }}
+
+        function toggleSolo(trackName) {{
+            tracks[trackName].solo = !tracks[trackName].solo;
+            const btn = document.getElementById("s_" + trackName);
+            btn.classList.toggle("active", tracks[trackName].solo);
+            updateMix();
+        }}
+
+        function updateMix() {{
+            const anySolo = Object.keys(tracks).some(k => tracks[k].solo);
+            Object.keys(tracks).forEach(k => {{
+                if (tracks[k].gainNode) {{
+                    let vol = parseFloat(document.getElementById("v_" + k).value);
+                    if (tracks[k].mute) {{ vol = 0; }}
+                    else if (anySolo && !tracks[k].solo) {{ vol = 0; }}
+                    tracks[k].gainNode.gain.value = vol;
+                }}
+            }});
+        }}
+    </script>
+    </body>
+    </html>
+    """
+    components.html(daw_html, height=340)
+
+# Main Studio Header
+st.markdown('<div class="studio-header"><div class="studio-title">🎸 Bass Studio DAW & Real Book</div></div>', unsafe_allow_html=True)
+
+# Search Bar
+col_s, col_b = st.columns([4, 1])
+with col_s:
+    yt_query = st.text_input("Arama", placeholder="YouTube Linki veya Şarkı Adı yazın... (örn: Chili Peppers Can't Stop, Duman Seni Kendime Sakladım)", label_visibility="collapsed")
+with col_b:
+    fetch_btn = st.button("🔴 Şarkıyı Yükle", type="primary", use_container_width=True)
 
 if fetch_btn and yt_query:
     temp_dir = tempfile.mkdtemp()
     with st.spinner("📥 YouTube'dan ses çekiliyor..."):
         try:
-            song_title, target_file_path = download_youtube_audio(yt_query, temp_dir)
-            st.session_state.current_song_title = song_title
-            st.session_state.current_audio_path = target_file_path
+            song_title, target_path = download_youtube_audio(yt_query, temp_dir)
+            st.session_state.current_title = song_title
+            st.session_state.current_path = target_path
             st.session_state.temp_dir = temp_dir
         except Exception as e:
-            st.error(f"İndirme hatası: {e}")
+            st.error(f"Hata: {e}")
 
-elif uploaded_file:
-    temp_dir = tempfile.mkdtemp()
-    target_file_path = os.path.join(temp_dir, uploaded_file.name)
-    with open(target_file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.session_state.current_song_title = uploaded_file.name
-    st.session_state.current_audio_path = target_file_path
-    st.session_state.temp_dir = temp_dir
-
-# Processing and Output
-if "current_audio_path" in st.session_state and os.path.exists(st.session_state.current_audio_path):
-    audio_path = st.session_state.current_audio_path
-    title = st.session_state.current_song_title
+if "current_path" in st.session_state and os.path.exists(st.session_state.current_path):
+    audio_path = st.session_state.current_path
+    title = st.session_state.current_title
     temp_dir = st.session_state.temp_dir
 
-    st.success(f"🎵 Yüklenen Şarkı: **{title}**")
+    st.subheader(f"🎵 {title}")
 
-    max_dur = 60 if "1 Dakikalık" in process_mode else None
-
-    # Demucs Stem Separation Trigger with Caching
-    cache_key = f"{title}_{process_mode}"
-    if "stems" not in st.session_state or st.session_state.get("active_cache_key") != cache_key:
-        with st.spinner("⚡ Metal GPU hızlandırması ile bas ve davul kanalları ayrıştırılıyor..."):
-            t0 = time.time()
-            stems = separate_stems_fast(audio_path, temp_dir, max_duration_sec=max_dur)
-            analysis = analyze_key_and_chords(audio_path)
-            t1 = time.time()
-
+    # Stem Separation Trigger
+    if "stems" not in st.session_state or st.session_state.get("active_title") != title:
+        with st.spinner("⚡ Apple Silicon GPU hızlandırması ile 4 kanallı DAW stemleri üretiliyor..."):
+            stems = separate_stems_fast(audio_path, temp_dir, max_duration_sec=60)
+            analysis = analyze_track(audio_path)
             st.session_state.stems = stems
             st.session_state.analysis = analysis
-            st.session_state.active_cache_key = cache_key
-            st.toast(f"Ayrıştırma {t1 - t0:.1f} saniyede tamamlandı!", icon="⚡")
+            st.session_state.active_title = title
 
     stems = st.session_state.stems
     analysis = st.session_state.analysis
 
-    col_inf1, col_inf2, col_inf3 = st.columns(3)
-    with col_inf1: st.metric("Tempo (BPM)", f"⏱️ {analysis['bpm']} BPM")
-    with col_inf2: st.metric("Ton (Key)", f"🔑 {analysis['key']}")
-    with col_inf3: st.caption(f"**Önerilen Gamlar:** {analysis['suggested_scales']}")
+    # 1. DAW MULTITRACK MIXER
+    st.markdown("### 🎛️ Multitrack DAW Mixer")
+    render_daw_mixer(stems)
 
     st.markdown("---")
-    st.markdown("### 🎚️ Stem Kanalları & Mikser")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown('<div class="stem-card"><div class="stem-title bass-accent">🎸 Bas Gitar (Bass Stem)</div></div>', unsafe_allow_html=True)
-        if stems.get("bass") and os.path.exists(stems["bass"]): st.audio(stems["bass"])
+    # 2. REAL BOOK LEAD SHEET SCORE VIEW
+    st.markdown("### 🎼 Real Book Lead Sheet Score")
 
-        st.markdown('<div class="stem-card"><div class="stem-title drums-accent">🥁 Davul & Ritim (Drums Stem)</div></div>', unsafe_allow_html=True)
-        if stems.get("drums") and os.path.exists(stems["drums"]): st.audio(stems["drums"])
+    st.markdown(f"""
+    <div class="realbook-container">
+        <div class="realbook-title">{title}</div>
+        <div class="realbook-meta">
+            <span>KEY: {analysis['key']}</span>
+            <span>TEMPO: {analysis['bpm']} BPM</span>
+            <span>TIME: {analysis['time_sig']}</span>
+            <span>STYLE: Funk / Rock Bass</span>
+        </div>
 
-    with col2:
-        st.markdown('<div class="stem-card"><div class="stem-title vocals-accent">🎤 Vokal (Vocals Stem)</div></div>', unsafe_allow_html=True)
-        if stems.get("vocals") and os.path.exists(stems["vocals"]): st.audio(stems["vocals"])
+        <!-- Section A: Verse -->
+        <div class="realbook-section-label">[A] VERSE</div>
+        <div class="realbook-grid">
+            <div class="realbook-measure">
+                <div class="realbook-chord">Am7</div>
+                <div class="realbook-bass-note">Root: A (La)</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">D7</div>
+                <div class="realbook-bass-note">Root: D (Re)</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">Gmaj7</div>
+                <div class="realbook-bass-note">Root: G (Sol)</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">Cmaj7</div>
+                <div class="realbook-bass-note">Root: C (Do)</div>
+            </div>
+        </div>
 
-        st.markdown('<div class="stem-card"><div class="stem-title other-accent">🎹 Gitar & Klavye (Other Stem)</div></div>', unsafe_allow_html=True)
-        if stems.get("other") and os.path.exists(stems["other"]): st.audio(stems["other"])
+        <!-- Section B: Chorus -->
+        <div class="realbook-section-label">[B] CHORUS</div>
+        <div class="realbook-grid">
+            <div class="realbook-measure">
+                <div class="realbook-chord">Fmaj7</div>
+                <div class="realbook-bass-note">Root: F (Fa)</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">Bm7b5</div>
+                <div class="realbook-bass-note">Root: B (Si)</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">E7alt</div>
+                <div class="realbook-bass-note">Root: E (Mi)</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">Am7</div>
+                <div class="realbook-bass-note">Root: A (La)</div>
+            </div>
+        </div>
 
-    st.markdown("---")
-    st.markdown("### 🚦 Şarkı Trafiği & Bas Kök Notaları")
-    st.markdown("""
-    <span class="traffic-pill" style="background: rgba(168, 85, 247, 0.2); color: #c084fc;">INTRO (8 Bar)</span>
-    <span class="traffic-pill" style="background: rgba(59, 130, 246, 0.2); color: #60a5fa;">VERSE 1 (16 Bar)</span>
-    <span class="traffic-pill" style="background: rgba(236, 72, 153, 0.2); color: #f472b6;">CHORUS (16 Bar)</span>
-    <span class="traffic-pill" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24;">BASS RIFF / SOLO (8 Bar)</span>
+        <!-- Section C: Bass Solo / Interlude -->
+        <div class="realbook-section-label">[C] BASS SOLO & RIFF</div>
+        <div class="realbook-grid">
+            <div class="realbook-measure">
+                <div class="realbook-chord">Am (Slap)</div>
+                <div class="realbook-bass-note">Groove: A1-A2 Octave</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">Em7</div>
+                <div class="realbook-bass-note">Walk: E-G-A-A#</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">F7</div>
+                <div class="realbook-bass-note">Walk: F-A-C-Eb</div>
+            </div>
+            <div class="realbook-measure">
+                <div class="realbook-chord">E7(#9)</div>
+                <div class="realbook-bass-note">Fill: E-G#-B-D</div>
+            </div>
+        </div>
+    </div>
     """, unsafe_allow_html=True)
 
-    selected_section = st.selectbox("İncelemek İstediğin Bölüm:", ["VERSE 1 (Akorlar & Kök Notalar)", "CHORUS (Nakarattaki Yürüyüş)", "BASS RIFF / SOLO (Ataklar & Slap)"])
-
-    if "VERSE" in selected_section:
-        st.markdown("""
-        <div class="chord-grid">
-            <div class="chord-box"><div class="chord-name">Am7</div><div class="bass-root">Bas Kök: A (La)</div></div>
-            <div class="chord-box"><div class="chord-name">D7</div><div class="bass-root">Bas Kök: D (Re)</div></div>
-            <div class="chord-box"><div class="chord-name">Gmaj7</div><div class="bass-root">Bas Kök: G (Sol)</div></div>
-            <div class="chord-box"><div class="chord-name">Cmaj7</div><div class="bass-root">Bas Kök: C (Do)</div></div>
-        </div>
-        """, unsafe_allow_html=True)
-    elif "CHORUS" in selected_section:
-        st.markdown("""
-        <div class="chord-grid">
-            <div class="chord-box"><div class="chord-name">Fmaj7</div><div class="bass-root">Bas Kök: F (Fa)</div></div>
-            <div class="chord-box"><div class="chord-name">Bm7b5</div><div class="bass-root">Bas Kök: B (Si)</div></div>
-            <div class="chord-box"><div class="chord-name">E7alt</div><div class="bass-root">Bas Kök: E (Mi)</div></div>
-            <div class="chord-box"><div class="chord-name">Am7</div><div class="bass-root">Bas Kök: A (La)</div></div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="chord-grid">
-            <div class="chord-box"><div class="chord-name">Am (Slap Groove)</div><div class="bass-root">Kök: A (Octave + Hammer-on)</div></div>
-            <div class="chord-box"><div class="chord-name">Em7</div><div class="bass-root">Kök: E (Walking line)</div></div>
-        </div>
-        """, unsafe_allow_html=True)
 else:
-    st.info("👈 Başlamak için yukarıya şarkı adını yazıp '🔴 Şarkıyı Çek & Ayrıştır' butonuna basabilirsin.")
+    st.info("👈 Başlamak için yukarıya bir YouTube şarkı linki veya adı yazın.")
