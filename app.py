@@ -196,9 +196,44 @@ def separate_stems(audio_path: str, output_dir: str, mode: str, preview_seconds:
     return separate_demucs(audio_path, output_dir, mode, preview_seconds)
 
 
+def make_chord_analysis_audio(stems: dict, fallback_audio: str, output_dir: str, sr: int = 22050):
+    """Build a cleaner harmonic source for chord detection.
+
+    Full-mix chord detection is easily confused by drums/vocals/melody.  When
+    stems exist, analyze mostly `other` + a little bass, not the whole mix.
+    """
+    try:
+        weights = [("other", 0.85), ("bass", 0.35), ("vocals", 0.10)]
+        loaded = []
+        for name, weight in weights:
+            path = stems.get(name)
+            if path and os.path.exists(path):
+                y, _ = librosa.load(path, sr=sr, mono=True)
+                loaded.append((y, weight))
+        if loaded:
+            n = min(len(y) for y, _ in loaded)
+            mix = np.zeros(n, dtype=np.float32)
+            for y, weight in loaded:
+                mix += weight * y[:n]
+            # Remove percussive residue and normalize softly.
+            mix, _ = librosa.effects.hpss(mix)
+            mix = mix / (np.max(np.abs(mix)) + 1e-8) * 0.85
+            out = os.path.join(output_dir, "chord_analysis_mix.wav")
+            sf.write(out, mix, sr)
+            return out
+    except Exception as exc:
+        st.warning(f"Stem tabanlı akor analiz mix'i hazırlanamadı, orijinal mix kullanılacak: {exc}")
+    return fallback_audio
+
+
 CHORD_QUALITIES = {
-    "": [0, 4, 7], "m": [0, 3, 7], "7": [0, 4, 7, 10], "m7": [0, 3, 7, 10],
-    "maj7": [0, 4, 7, 11], "dim": [0, 3, 6], "sus4": [0, 5, 7], "6": [0, 4, 7, 9], "m6": [0, 3, 7, 9]
+    "": [0, 4, 7],
+    "m": [0, 3, 7],
+    "7": [0, 4, 7, 10],
+    "m7": [0, 3, 7, 10],
+    "maj7": [0, 4, 7, 11],
+    "sus4": [0, 5, 7],
+    "dim": [0, 3, 6],
 }
 
 
@@ -209,7 +244,10 @@ def chord_templates():
             vec = np.zeros(12)
             for i in intervals:
                 vec[(root_idx + i) % 12] = 1.0
-            vec[root_idx] = 1.28
+            vec[root_idx] = 1.45
+            vec[(root_idx + 7) % 12] = max(vec[(root_idx + 7) % 12], 1.05)
+            if suffix in ("7", "m7", "maj7"):
+                vec[(root_idx + (11 if suffix == "maj7" else 10)) % 12] = 0.82
             vec /= np.linalg.norm(vec) + 1e-8
             templates.append((root, suffix, vec))
     return templates
@@ -221,44 +259,48 @@ TEMPLATES = chord_templates()
 def normalize_chord_name(chord: str):
     if not chord or chord == "N" or chord == "N.C.":
         return "N.C."
-    chord = chord.replace(":", "").replace("min", "m").replace("maj", "maj")
-    return chord
+    return chord.replace(":", "").replace("min", "m").replace("maj", "maj")
 
 
-def detect_chord_name(chroma_vec: np.ndarray):
-    v = np.maximum(chroma_vec, 0)
+def chord_root_suffix(chord: str):
+    if not chord or chord == "N.C.":
+        return None, ""
+    for root in sorted(NOTES, key=len, reverse=True):
+        if chord.startswith(root):
+            return root, chord[len(root):]
+    return None, ""
+
+
+def detect_chord_name(chroma_vec: np.ndarray, key_hint: str | None = None):
+    v = np.maximum(chroma_vec, 0).astype(float)
+    if float(np.sum(v)) < 1e-7:
+        return "N.C.", "-", 0.0
+    # Compress outlier melody notes and normalize.
+    v = np.sqrt(v)
     v = v / (np.linalg.norm(v) + 1e-8)
-    root_energy = v / (np.max(v) + 1e-8)
-    best_score = -1
+    best_score = -1.0
     best = ("N.C.", "-", 0.0)
+    key_root = None
+    if key_hint:
+        key_root, _ = chord_root_suffix(key_hint.replace("m", ""))
     for root, suffix, tmpl in TEMPLATES:
+        root_idx = NOTES.index(root)
         score = float(np.dot(v, tmpl))
-        root_bonus = 0.08 * float(root_energy[NOTES.index(root)])
-        score += root_bonus
+        # Penalize contradictions that often cause false major/minor flips.
+        maj3, min3 = (root_idx + 4) % 12, (root_idx + 3) % 12
+        if suffix.startswith("m") and v[maj3] > v[min3] * 1.20:
+            score -= 0.10
+        if suffix in ("", "7", "maj7") and v[min3] > v[maj3] * 1.20:
+            score -= 0.10
+        # Mild diatonic/key stability bias; never enough to override clear audio.
+        if key_root and root == key_root:
+            score += 0.025
         if score > best_score:
             best_score = score
-            best = (f"{root}{suffix}", f"{root} ({NOTE_TR[root]})", min(score, 1.0))
-    if best_score < 0.50:
+            best = (f"{root}{suffix}", f"{root} ({NOTE_TR[root]})", min(max(score, 0.0), 1.0))
+    if best_score < 0.46:
         return "N.C.", "-", best_score
     return best
-
-
-def essentia_chords(audio_path: str, duration: int | None, bpm_fallback: int):
-    if es is None:
-        return None
-    try:
-        y, sr = librosa.load(audio_path, sr=44100, duration=duration, mono=True)
-        if not len(y):
-            return None
-        key, scale, key_strength = es.KeyExtractor(sampleRate=sr)(y.astype("float32"))
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, bins_per_octave=36)
-        pcp = chroma.T.astype("float32")
-        chords, strengths = es.ChordsDetection(hopSize=512, sampleRate=sr)(pcp)
-        times = librosa.frames_to_time(np.arange(len(chords)), sr=sr, hop_length=512)
-        return {"chords": [normalize_chord_name(c) for c in chords], "strengths": list(map(float, strengths)), "times": times, "key": f"{key}{'m' if scale == 'minor' else ''}", "key_strength": float(key_strength)}
-    except Exception:
-        return None
-
 
 
 def estimate_tempo_beats(audio_path: str, duration: int | None):
@@ -268,36 +310,73 @@ def estimate_tempo_beats(audio_path: str, duration: int | None):
     bpm = int(np.round(float(tempo_arr[0]))) if tempo_arr.size else 120
     if bpm <= 0:
         bpm = 120
+    while bpm < 70:
+        bpm *= 2
+    while bpm > 210:
+        bpm = int(round(bpm / 2))
     if len(beats) < 8:
         hop = 512
         step = max(1, int((60 / bpm) * sr / hop))
         beats = np.arange(0, max(1, len(y) // hop), step)
     beat_times = librosa.frames_to_time(beats, sr=sr)
-    return y, sr, bpm, beats, beat_times
+    return y, sr, bpm, np.asarray(beats, dtype=int), beat_times
 
 
-def bars_from_beat_times(beat_times, bpm: int, audio_len_sec: float | None = None):
+def choose_bar_offset(beats, chroma, y, sr):
+    if len(beats) < 8:
+        return 0
+    onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
+    best_offset, best_score = 0, -1e9
+    for offset in range(4):
+        confs, downbeats = [], []
+        for i in range(offset, max(offset, len(beats) - 4), 4):
+            if i + 4 >= len(beats):
+                break
+            seg = chroma[:, beats[i]:beats[i + 4]]
+            if seg.size == 0:
+                continue
+            _, _, conf = detect_chord_name(np.median(seg, axis=1))
+            confs.append(conf)
+            if beats[i] < len(onset):
+                downbeats.append(onset[beats[i]])
+        if confs:
+            score = float(np.mean(confs)) + 0.04 * float(np.mean(downbeats) if downbeats else 0.0) - 0.015 * offset
+            if score > best_score:
+                best_score, best_offset = score, offset
+    return best_offset
+
+
+def smooth_bars(bars: list[dict]):
+    if len(bars) < 3:
+        return bars
+    out = [dict(b) for b in bars]
+    for i in range(1, len(out) - 1):
+        prev_c, cur_c, next_c = out[i - 1]["chord"], out[i]["chord"], out[i + 1]["chord"]
+        if prev_c == next_c and cur_c != prev_c and out[i]["confidence"] < 0.78:
+            out[i]["chord"] = prev_c
+            root, _ = chord_root_suffix(prev_c)
+            out[i]["root"] = f"{root} ({NOTE_TR.get(root, root)})" if root else out[i]["root"]
+            out[i]["source"] += "+smoothed"
+    return out
+
+
+def bars_from_beat_times(beat_times, bpm: int, audio_len_sec: float | None = None, offset: int = 0):
     bars = []
     if len(beat_times) >= 5:
-        for i in range(0, len(beat_times) - 4, 4):
+        for i in range(offset, len(beat_times) - 4, 4):
             start_t = float(beat_times[i])
             end_t = float(beat_times[min(i + 4, len(beat_times) - 1)])
             if end_t > start_t:
-                bars.append((start_t, end_t))
+                bars.append((start_t, end_t, i, i + 4))
     if not bars:
         bar_len = 4 * 60 / max(bpm, 1)
         total = audio_len_sec or bar_len * 8
         count = max(1, int(np.ceil(total / bar_len)))
-        bars = [(i * bar_len, min((i + 1) * bar_len, total)) for i in range(count)]
+        bars = [(i * bar_len, min((i + 1) * bar_len, total), None, None) for i in range(count)]
     return bars
 
 
-def normalize_note_chord(chord: str):
-    chord = normalize_chord_name(chord)
-    return chord.replace(":maj", "").replace(":min", "m")
-
-
-def basic_pitch_chords(audio_path: str, duration: int | None, bpm: int, beat_times):
+def basic_pitch_chords(audio_path: str, duration: int | None, bpm: int, beat_times, offset: int = 0):
     if basic_pitch_predict is None:
         return None
     try:
@@ -307,66 +386,74 @@ def basic_pitch_chords(audio_path: str, duration: int | None, bpm: int, beat_tim
             audio_len_sec = librosa.get_duration(path=source)
         except Exception:
             audio_len_sec = None
-        bar_times = bars_from_beat_times(beat_times, bpm, audio_len_sec)
+        bar_times = bars_from_beat_times(beat_times, bpm, audio_len_sec, offset=offset)
         bars = []
-        for idx, (start_t, end_t) in enumerate(bar_times, start=1):
+        for idx, (start_t, end_t, _, _) in enumerate(bar_times, start=1):
             vec = np.zeros(12)
             for ev in note_events:
-                # Basic Pitch event tuple: start, end, midi_pitch, amplitude, pitch_bends
                 n_start, n_end, midi_pitch = float(ev[0]), float(ev[1]), int(ev[2])
                 amp = float(ev[3]) if len(ev) > 3 and ev[3] is not None else 1.0
                 overlap = max(0.0, min(end_t, n_end) - max(start_t, n_start))
                 if overlap <= 0:
                     continue
                 pc = midi_pitch % 12
-                # Down-weight very high melody notes a little; bass/mid notes are better chord evidence.
-                octave_weight = 1.15 if midi_pitch < 60 else (0.92 if midi_pitch > 76 else 1.0)
+                octave_weight = 1.25 if midi_pitch < 60 else (0.85 if midi_pitch > 76 else 1.0)
                 vec[pc] += overlap * max(amp, 0.05) * octave_weight
             chord, root, conf = detect_chord_name(vec)
             if np.sum(vec) <= 1e-6:
                 chord, root, conf = "N.C.", "-", 0.0
             bars.append({"bar_num": idx, "chord": chord, "root": root, "confidence": round(float(conf), 2), "start": round(start_t, 3), "end": round(end_t, 3), "source": "basic-pitch-midi"})
-        return bars, note_events
+        return smooth_bars(bars), note_events
     except Exception as exc:
         st.warning(f"Basic Pitch modeli çalışmadı, fallback kullanılacak: {exc}")
         return None
 
 
 def infer_key_from_bars(bars: list[dict]):
+    counts = {}
     for b in bars:
         c = b.get("chord", "N.C.")
-        if c != "N.C.":
-            key = c
-            for suffix in ("maj7", "m7", "dim", "sus4", "7", "m6", "6", "m"):
-                if key.endswith(suffix):
-                    return key[: -len(suffix)] + ("m" if suffix in ("m", "m7", "m6") else "")
-            return key
-    return "C"
+        root, suffix = chord_root_suffix(c)
+        if root:
+            minor = suffix.startswith("m") and not suffix.startswith("maj")
+            k = root + ("m" if minor else "")
+            counts[k] = counts.get(k, 0.0) + 1.0 + float(b.get("confidence", 0))
+    return max(counts, key=counts.get) if counts else "C"
 
 
-def detect_chords_for_audio(audio_path: str, duration: int | None = 120, engine: str = "Basic Pitch MIDI + Music21"):
+def detect_chords_for_audio(audio_path: str, duration: int | None = 120, engine: str = "Harmonic Consensus"):
     y, sr, bpm, beats, beat_times = estimate_tempo_beats(audio_path, duration)
-    if engine.startswith("Basic Pitch"):
-        bp = basic_pitch_chords(audio_path, duration, bpm, beat_times)
-        if bp is not None:
-            bars, note_events = bp
-            key = infer_key_from_bars(bars)
-            return bpm, key, bars
-    y_harm, _ = librosa.effects.hpss(y)
+    y_harm, _ = librosa.effects.hpss(y, margin=(1.0, 3.0))
     chroma_cqt = librosa.feature.chroma_cqt(y=y_harm, sr=sr, bins_per_octave=36)
     chroma_cens = librosa.feature.chroma_cens(y=y_harm, sr=sr)
+    chroma = (0.82 * chroma_cqt) + (0.18 * chroma_cens)
+    offset = choose_bar_offset(beats, chroma, y, sr)
+
+    if engine.startswith("Basic Pitch"):
+        bp = basic_pitch_chords(audio_path, duration, bpm, beat_times, offset=offset)
+        if bp is not None:
+            bars, _ = bp
+            return bpm, infer_key_from_bars(bars), bars
+
+    try:
+        audio_len_sec = librosa.get_duration(y=y, sr=sr)
+    except Exception:
+        audio_len_sec = None
+    bar_times = bars_from_beat_times(beat_times, bpm, audio_len_sec, offset=offset)
     essentia_data = essentia_chords(audio_path, duration, bpm) if engine.startswith("Essentia") else None
     bars = []
-    for i in range(0, max(0, len(beats) - 4), 4):
-        start_frame, end_frame = beats[i], beats[min(i + 4, len(beats) - 1)]
+    key_hint = None
+    for idx, (start_t, end_t, start_beat_idx, end_beat_idx) in enumerate(bar_times, start=1):
+        if start_beat_idx is not None and end_beat_idx is not None and end_beat_idx < len(beats):
+            start_frame, end_frame = beats[start_beat_idx], beats[end_beat_idx]
+        else:
+            start_frame = librosa.time_to_frames(start_t, sr=sr)
+            end_frame = librosa.time_to_frames(end_t, sr=sr)
         if end_frame <= start_frame:
             continue
-        vec1 = np.median(chroma_cqt[:, start_frame:end_frame], axis=1)
-        vec2 = np.median(chroma_cens[:, start_frame:end_frame], axis=1)
-        chord_l, root_l, conf_l = detect_chord_name((0.72 * vec1) + (0.28 * vec2))
-        start_t = float(beat_times[i]) if i < len(beat_times) else len(bars) * 4 * 60 / bpm
-        end_t = float(beat_times[min(i + 4, len(beat_times) - 1)]) if len(beat_times) else start_t + 4 * 60 / bpm
-        chord, root, conf, source = chord_l, root_l, conf_l, "librosa-ensemble"
+        vec = np.median(chroma[:, start_frame:end_frame], axis=1)
+        chord, root, conf = detect_chord_name(vec, key_hint=key_hint)
+        source = f"harmonic-consensus/o{offset}"
         if essentia_data:
             idxs = [j for j, t in enumerate(essentia_data["times"]) if start_t <= float(t) < end_t]
             if idxs:
@@ -378,28 +465,20 @@ def detect_chords_for_audio(audio_path: str, duration: int | None = 120, engine:
                 if candidates:
                     c_e = max(candidates, key=candidates.get)
                     score_e = min(1.0, candidates[c_e] / max(1, len(idxs)))
-                    # Prefer Essentia when it is confident, otherwise keep the more stable template result.
-                    if score_e >= 0.45 or conf_l < 0.58:
+                    if score_e > conf + 0.10:
                         chord = c_e
-                        root_note = c_e.replace("maj7", "").replace("m7", "").replace("dim", "").replace("sus4", "").replace("7", "").replace("6", "").replace("m", "")
-                        root = f"{root_note} ({NOTE_TR.get(root_note, root_note)})" if root_note in NOTE_TR else root_l
-                        conf = max(score_e, conf_l * 0.92)
-                        source = "essentia+librosa"
+                        root_note, _ = chord_root_suffix(c_e)
+                        root = f"{root_note} ({NOTE_TR.get(root_note, root_note)})" if root_note else root
+                        conf = score_e
+                        source = "essentia-consensus"
         bars.append({"bar_num": len(bars) + 1, "chord": chord, "root": root, "confidence": round(float(conf), 2), "start": round(start_t, 3), "end": round(end_t, 3), "source": source})
+        if idx <= 4 and chord != "N.C.":
+            key_hint = infer_key_from_bars(bars)
     if not bars:
         bar_len = 4 * 60 / bpm
         bars = [{"bar_num": i + 1, "chord": "N.C.", "root": "-", "confidence": 0.0, "start": round(i * bar_len, 3), "end": round((i + 1) * bar_len, 3), "source": "fallback"} for i in range(8)]
-    key = essentia_data["key"] if essentia_data and essentia_data.get("key") else "C"
-    if key == "C":
-        for b in bars:
-            if b["chord"] != "N.C.":
-                key = b["chord"]
-                for suffix in ("maj7", "m7", "dim", "sus4", "7", "m6", "6", "m"):
-                    if key.endswith(suffix):
-                        key = key[: -len(suffix)] + ("m" if suffix in ("m", "m7", "m6") else "")
-                        break
-                break
-    return bpm, key, bars
+    bars = smooth_bars(bars)
+    return bpm, infer_key_from_bars(bars), bars
 
 
 def make_abc(title: str, bpm: int, key: str, bars: list[dict]):
@@ -477,7 +556,7 @@ with st.container():
     with c3:
         scope = st.selectbox("Süre", ["İlk 90 sn", "İlk 180 sn", "Tam şarkı"], label_visibility="collapsed")
     with c4:
-        chord_engine = st.selectbox("Akor", ["Basic Pitch MIDI + Music21", "Essentia + Librosa ensemble", "Librosa ensemble"], label_visibility="collapsed")
+        chord_engine = st.selectbox("Akor", ["Harmonic Consensus", "Essentia Consensus", "Basic Pitch MIDI + Music21", "Librosa ensemble"], label_visibility="collapsed")
     with c5:
         run = st.button("Yükle", type="primary", use_container_width=True)
     st.markdown("<div class='small-note'>Öneri: önce Kaliteli pratik + İlk 90 sn. UVR deneysel mod ilk kullanımda model indirebilir ve uzun sürebilir.</div>", unsafe_allow_html=True)
@@ -506,7 +585,9 @@ if "current_path" in st.session_state and os.path.exists(st.session_state.curren
                 stems, sep_settings = {}, {"engine": "none", "model": "chord-only", "shifts": "-", "overlap": "-"}
             else:
                 stems, sep_settings, work_audio = separate_stems(audio_path, temp_dir, mode, preview_seconds)
-            bpm, key, bars = detect_chords_for_audio(work_audio, duration=None, engine=chord_engine)
+            analysis_audio = make_chord_analysis_audio(stems, work_audio, temp_dir)
+            bpm, key, bars = detect_chords_for_audio(analysis_audio, duration=None, engine=chord_engine)
+            st.session_state.analysis_audio = analysis_audio
             st.session_state.stems = stems
             st.session_state.work_audio = work_audio
             st.session_state.sep_settings = sep_settings
