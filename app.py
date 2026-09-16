@@ -190,9 +190,53 @@ def separate_uvr(audio_path: str, output_dir: str, preview_seconds: int | None):
     return stems, settings, work_audio
 
 
+def first_existing_with_terms(output_dir: str, preferred: list[str], exclude: list[str] | None = None):
+    exclude = exclude or []
+    files = list(Path(output_dir).rglob("*.wav")) + list(Path(output_dir).rglob("*.flac")) + list(Path(output_dir).rglob("*.mp3"))
+    allowed = [p for p in files if not any(x in p.name.lower() for x in exclude)]
+    for term in preferred:
+        for p in allowed:
+            low = p.name.lower()
+            if term in low:
+                return str(p)
+    return str(allowed[0]) if allowed else None
+
+
+def separate_melroformer_demucs(audio_path: str, output_dir: str, preview_seconds: int | None):
+    """High-quality local stem path: Kimberley MelBand RoFormer vocals + htdemucs_ft.
+
+    RoFormer gives better vocal/instrumental separation; Demucs FT supplies bass/drums.
+    First run may download large MIT-model files via audio-separator.
+    """
+    work_audio = trim_audio(audio_path, output_dir, preview_seconds)
+    settings = {"engine": "Mel-RoFormer + Demucs FT", "model": "vocals_mel_band_roformer.ckpt + htdemucs_ft", "shifts": 2, "overlap": 0.25}
+    stems = {}
+    if UVRSeparator is not None:
+        try:
+            ro_dir = os.path.join(output_dir, "mel_roformer_kimberley")
+            os.makedirs(ro_dir, exist_ok=True)
+            sep = UVRSeparator(output_dir=ro_dir, output_format="WAV", sample_rate=44100, normalization_threshold=0.92)
+            sep.load_model(model_filename="vocals_mel_band_roformer.ckpt")
+            sep.separate(work_audio)
+            vocal = first_existing_with_terms(ro_dir, ["(vocals)", "vocals", "vocal"])
+            instr = first_existing_with_terms(ro_dir, ["(other)", "other", "instrumental", "no_vocals", "inst"])
+            if vocal:
+                out = os.path.join(output_dir, "vocals_melroformer.wav"); shutil.copyfile(vocal, out); stems["vocals"] = out
+            if instr:
+                out = os.path.join(output_dir, "other_melroformer.wav"); shutil.copyfile(instr, out); stems["other"] = out
+        except Exception as exc:
+            st.warning(f"Mel-RoFormer vokal modeli çalışmadı; Demucs fallback kullanılacak: {exc}")
+    demucs_stems, _, _ = separate_demucs(audio_path, output_dir, "Kaliteli pratik", preview_seconds)
+    # Prefer RoFormer vocals/other where available, Demucs for bass/drums.
+    demucs_stems.update(stems)
+    return demucs_stems, settings, work_audio
+
+
 def separate_stems(audio_path: str, output_dir: str, mode: str, preview_seconds: int | None):
     if mode == "UVR deneysel bass/drum":
         return separate_uvr(audio_path, output_dir, preview_seconds)
+    if mode == "Mel-RoFormer + Demucs FT":
+        return separate_melroformer_demucs(audio_path, output_dir, preview_seconds)
     return separate_demucs(audio_path, output_dir, mode, preview_seconds)
 
 
@@ -477,8 +521,36 @@ def detect_chords_for_audio(audio_path: str, duration: int | None = 120, engine:
     if not bars:
         bar_len = 4 * 60 / bpm
         bars = [{"bar_num": i + 1, "chord": "N.C.", "root": "-", "confidence": 0.0, "start": round(i * bar_len, 3), "end": round((i + 1) * bar_len, 3), "source": "fallback"} for i in range(8)]
-    bars = smooth_bars(bars)
+    bars = enrich_bars_with_scales(smooth_bars(bars))
     return bpm, infer_key_from_bars(bars), bars
+
+
+
+def chord_scale_ideas(chord: str):
+    root, suffix = chord_root_suffix(chord)
+    if not root:
+        return {"scale": "-", "tones": "-", "idea": "Dinlen / yaklaşım notaları"}
+    formulas = {
+        "m7": ("Dorian", [0, 2, 3, 5, 7, 9, 10], "1-2-b3-4-5-6-b7"),
+        "m": ("Dorian / Aeolian", [0, 2, 3, 5, 7, 9, 10], "minor vamp: 1-b3-4-5-b7"),
+        "7": ("Mixolydian", [0, 2, 4, 5, 7, 9, 10], "dominant: 3-b7 hedefle"),
+        "maj7": ("Ionian / Lydian", [0, 2, 4, 6, 7, 9, 11], "maj7: 3-5-7, #11 renk"),
+        "": ("Ionian / Major Pentatonic", [0, 2, 4, 7, 9], "major pentatonic güvenli"),
+        "sus4": ("Mixolydian sus", [0, 2, 5, 7, 9, 10], "4 ve b7 çevresinde dolaş"),
+        "dim": ("Half-whole diminished", [0, 1, 3, 4, 6, 7, 9, 10], "simetrik diminished"),
+    }
+    mode, intervals, idea = formulas.get(suffix, formulas["m7" if suffix.startswith("m") else ""])
+    notes = [NOTES[(NOTES.index(root) + i) % 12] for i in intervals]
+    return {"scale": f"{root} {mode}", "tones": " ".join(notes), "idea": idea}
+
+
+def enrich_bars_with_scales(bars: list[dict]):
+    enriched = []
+    for b in bars:
+        nb = dict(b)
+        nb.update(chord_scale_ideas(nb.get("chord", "N.C.")))
+        enriched.append(nb)
+    return enriched
 
 
 def make_abc(title: str, bpm: int, key: str, bars: list[dict]):
@@ -520,11 +592,11 @@ import RegionsPlugin from 'https://unpkg.com/wavesurfer.js@7/dist/plugins/region
 window.WaveSurfer = WaveSurfer; window.RegionsPlugin = RegionsPlugin;
 </script>
 <style>
-*{box-sizing:border-box} body{margin:0;background:#f6f1e6;color:#171717;font-family:Arial,Helvetica,sans-serif}.wrap{border:1px solid #d8cdb9;background:#f6f1e6;border-radius:12px;overflow:hidden}.player{position:sticky;top:0;z-index:5;background:#f8f4ea;border-bottom:1px solid #d8cdb9;padding:8px 10px}.transport{display:grid;grid-template-columns:auto auto auto auto auto 1fr auto auto;gap:6px;align-items:center}.play{width:34px;height:34px;border-radius:50%;border:1px solid #111;background:#111;color:#fff;font-weight:900;cursor:pointer}.btn{height:28px;border:1px solid #111;border-radius:6px;background:#fffaf0;color:#111;font-weight:800;font-size:11px;cursor:pointer}.btn.active{background:#111;color:#fff}.title{font-weight:800;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.time{font:800 11px ui-monospace,Menlo,monospace}.speed{height:28px;border:1px solid #111;background:#fffaf0;border-radius:6px;font-weight:700}.master{width:82px;accent-color:#111}.wavebox{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-top:6px}.wave{height:34px;border:1px solid #111;background:#fffaf0;border-radius:6px;overflow:hidden}.loop-read{font:800 11px ui-monospace,Menlo,monospace;min-width:125px}.hint{font-size:11px;color:#5f5748;margin-top:4px}.mixer{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:6px}.track{display:grid;grid-template-columns:auto 1fr auto auto 76px;gap:4px;align-items:center;border:1px solid #d8cdb9;background:#fffaf0;border-radius:7px;padding:4px;font-size:11px}.tog{height:21px;min-width:23px;border:1px solid #777;background:white;border-radius:4px;font-weight:900;font-size:10px}.tog.m.active{background:#ef4444;color:white}.tog.s.active{background:#facc15;color:#111}.vol{width:76px;accent-color:#111}.score-panel{padding:12px}.score-title{display:flex;justify-content:space-between;gap:12px;align-items:end;margin-bottom:9px}.song{font-size:22px;font-weight:900;letter-spacing:-.02em}.meta{font:800 12px ui-monospace,Menlo,monospace}.sheet{height:500px;overflow:auto;background:#fffdf7;border:1px solid #111;border-radius:8px;padding:12px}.system{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:0;margin-bottom:18px;border-left:2px solid #111}.measure{position:relative;height:118px;border-right:2px solid #111;background:transparent;cursor:pointer}.measure.active{background:rgba(252,211,77,.25)}.measure.active:after{content:"";position:absolute;top:18px;bottom:14px;left:50%;border-left:3px solid #ef4444}.chord{position:absolute;top:0;left:10px;font-size:23px;font-weight:900}.barno{position:absolute;top:2px;right:7px;font:800 10px ui-monospace,Menlo,monospace;color:#777}.staff{position:absolute;left:0;right:0;top:38px;height:48px}.staff i{position:absolute;left:0;right:0;border-top:1.5px solid #111}.slash{position:absolute;top:50px;left:45%;font-size:28px;font-weight:900;transform:rotate(-18deg)}.root{position:absolute;left:10px;bottom:8px;font-size:10px;color:#555}.section{font:900 12px ui-monospace,Menlo,monospace;margin:10px 0 5px}.empty{font-weight:800;color:#6b6254}.footer-note{font-size:11px;color:#5f5748;margin-top:7px}@media(max-width:760px){.transport{grid-template-columns:auto auto auto auto}.mixer{grid-template-columns:1fr 1fr}.system{grid-template-columns:repeat(2,1fr)}}
+*{box-sizing:border-box} body{margin:0;background:#f6f1e6;color:#171717;font-family:Arial,Helvetica,sans-serif}.wrap{border:1px solid #d8cdb9;background:#f6f1e6;border-radius:12px;overflow:hidden}.player{position:sticky;top:0;z-index:5;background:#f8f4ea;border-bottom:1px solid #d8cdb9;padding:8px 10px}.transport{display:grid;grid-template-columns:auto auto auto auto auto 1fr auto auto;gap:6px;align-items:center}.play{width:34px;height:34px;border-radius:50%;border:1px solid #111;background:#111;color:#fff;font-weight:900;cursor:pointer}.btn{height:28px;border:1px solid #111;border-radius:6px;background:#fffaf0;color:#111;font-weight:800;font-size:11px;cursor:pointer}.btn.active{background:#111;color:#fff}.title{font-weight:800;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.time{font:800 11px ui-monospace,Menlo,monospace}.speed{height:28px;border:1px solid #111;background:#fffaf0;border-radius:6px;font-weight:700}.master{width:82px;accent-color:#111}.wavebox{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-top:6px}.wave{height:34px;border:1px solid #111;background:#fffaf0;border-radius:6px;overflow:hidden}.loop-read{font:800 11px ui-monospace,Menlo,monospace;min-width:125px}.hint{font-size:11px;color:#5f5748;margin-top:4px}.mixer{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:6px}.track{display:grid;grid-template-columns:auto 1fr auto auto 76px;gap:4px;align-items:center;border:1px solid #d8cdb9;background:#fffaf0;border-radius:7px;padding:4px;font-size:11px}.tog{height:21px;min-width:23px;border:1px solid #777;background:white;border-radius:4px;font-weight:900;font-size:10px}.tog.m.active{background:#ef4444;color:white}.tog.s.active{background:#facc15;color:#111}.vol{width:76px;accent-color:#111}.score-panel{padding:12px}.score-title{display:flex;justify-content:space-between;gap:12px;align-items:end;margin-bottom:9px}.song{font-size:22px;font-weight:900;letter-spacing:-.02em}.meta{font:800 12px ui-monospace,Menlo,monospace}.sheet{height:500px;overflow:auto;background:#fffdf7;border:1px solid #111;border-radius:8px;padding:12px}.system{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:0;margin-bottom:18px;border-left:2px solid #111}.measure{position:relative;height:118px;border-right:2px solid #111;background:transparent;cursor:pointer}.measure.active{background:rgba(252,211,77,.25)}.measure.active:after{content:"";position:absolute;top:18px;bottom:14px;left:50%;border-left:3px solid #ef4444}.chord{position:absolute;top:0;left:10px;font-size:23px;font-weight:900}.barno{position:absolute;top:2px;right:7px;font:800 10px ui-monospace,Menlo,monospace;color:#777}.staff{position:absolute;left:0;right:0;top:38px;height:48px}.staff i{position:absolute;left:0;right:0;border-top:1.5px solid #111}.slash{position:absolute;top:50px;left:45%;font-size:28px;font-weight:900;transform:rotate(-18deg)}.root{position:absolute;left:10px;bottom:28px;font-size:10px;color:#555}.scale{position:absolute;left:10px;right:8px;bottom:8px;font-size:10px;color:#1d4ed8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.section{font:900 12px ui-monospace,Menlo,monospace;margin:10px 0 5px}.empty{font-weight:800;color:#6b6254}.footer-note{font-size:11px;color:#5f5748;margin-top:7px}@media(max-width:760px){.transport{grid-template-columns:auto auto auto auto}.mixer{grid-template-columns:1fr 1fr}.system{grid-template-columns:repeat(2,1fr)}}
 </style></head><body><div class="wrap">
 <div class="player"><div class="transport"><button id="play" class="play">▶</button><button class="btn" onclick="jump(-10)">-10</button><button class="btn" onclick="jump(10)">+10</button><button class="btn" onclick="markA()">A koy</button><button class="btn" onclick="markB()">B koy</button><div class="title" id="songTitle"></div><select id="speed" class="speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option></select><input id="master" class="master" title="Master" type="range" min="0" max="1" step="0.01" value="1"><div class="time"><span id="cur">00:00</span>/<span id="dur">00:00</span></div></div>
 <div class="wavebox"><div id="wave" class="wave"></div><div class="loop-read" id="loopRead">Loop: kapalı</div></div><div class="hint">Loop: çalarken “A koy”, sonra “B koy”. İstersen waveform üzerinde sürükleyerek de bölge seçebilirsin. Player artık notation scroll’dan ayrı/sabit.</div><div id="mixer" class="mixer"></div></div>
-<div class="score-panel"><div class="score-title"><div><div class="song" id="scoreTitle"></div><div class="meta">Real Book staff view • 4 ölçü/satır • slash notation</div></div><div class="meta" id="barStatus">bar -</div></div><div id="sheet" class="sheet"></div><div class="footer-note">Not: Melodi transkripsiyonu henüz basitleştirilmiş slash notation. Akorlar Basic Pitch MIDI notalarından çıkarılıyor; ölçüye tıklayınca player o ölçüye gider.</div></div>
+<div class="score-panel"><div class="score-title"><div><div class="song" id="scoreTitle"></div><div class="meta">iReal Pro tarzı chart • akor takip • modal fikirler</div></div><div class="meta" id="barStatus">bar -</div></div><div id="sheet" class="sheet"></div><div class="footer-note">Ölçüye tıkla: player o ölçüye gider. Her ölçüde önerilen modal dizi ve hedef ses fikri görünür.</div></div>
 </div><script type="module">
 const DATA=__DATA__; const $=id=>document.getElementById(id); const fmt=t=>{if(!isFinite(t))return'00:00';let m=Math.floor(t/60),s=Math.floor(t%60);return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')};
 function waitForLibs(){return new Promise(r=>{const t=setInterval(()=>{if(window.WaveSurfer&&window.RegionsPlugin){clearInterval(t);r()}},30)})} await waitForLibs(); $('songTitle').textContent=DATA.title; $('scoreTitle').textContent=DATA.title;
@@ -537,7 +609,7 @@ window.markA=()=>{loopA=ws.getCurrentTime(); if(loopB!=null&&loopB<=loopA)loopB=
 const tracks={}; function buildMixer(){const m=$('mixer'); if(DATA.tracks.length===0){m.innerHTML='<div class="empty">Stem yok: orijinal mix çalıyor.</div>';return;} DATA.tracks.forEach(tr=>{const a=new Audio(tr.src); a.preload='auto'; tracks[tr.id]={...tr,audio:a,mute:false,solo:false,vol:1}; const row=document.createElement('div'); row.className='track'; row.innerHTML=`<b style="color:${tr.color}">${tr.icon}</b><span>${tr.name}</span><button id="m_${tr.id}" class="tog m">M</button><button id="s_${tr.id}" class="tog s">S</button><input id="v_${tr.id}" class="vol" type="range" min="0" max="1.5" step="0.01" value="1">`; m.appendChild(row); $(`m_${tr.id}`).onclick=()=>{tracks[tr.id].mute=!tracks[tr.id].mute;$(`m_${tr.id}`).classList.toggle('active',tracks[tr.id].mute);applyMix()}; $(`s_${tr.id}`).onclick=()=>{tracks[tr.id].solo=!tracks[tr.id].solo;$(`s_${tr.id}`).classList.toggle('active',tracks[tr.id].solo);applyMix()}; $(`v_${tr.id}`).oninput=e=>{tracks[tr.id].vol=parseFloat(e.target.value);applyMix()};});}
 function applyMix(){const anySolo=Object.values(tracks).some(t=>t.solo); const master=parseFloat($('master').value); if(DATA.tracks.length===0)ws.setVolume(master); Object.values(tracks).forEach(t=>{let v=t.vol*master; if(t.mute||(anySolo&&!t.solo))v=0; t.audio.volume=Math.max(0,Math.min(1,v));});} $('master').oninput=applyMix; $('speed').onchange=e=>{let r=parseFloat(e.target.value); ws.setPlaybackRate(r,true); Object.values(tracks).forEach(t=>t.audio.playbackRate=r);};
 function seekAll(time,play=false){ws.setTime(time); Object.values(tracks).forEach(t=>{t.audio.currentTime=time;if(play)t.audio.play();});} function syncStemTime(time){Object.values(tracks).forEach(t=>{if(Math.abs(t.audio.currentTime-time)>.22)t.audio.currentTime=time;});} window.jump=s=>seekAll(Math.max(0,Math.min(ws.getDuration(),ws.getCurrentTime()+s)),ws.isPlaying()); buildMixer(); applyMix();
-function renderSheet(){const sheet=$('sheet'); if(!DATA.bars.length){sheet.innerHTML='<div class="empty">Notation üretilemedi.</div>';return;} for(let i=0;i<DATA.bars.length;i+=4){const sec=document.createElement('div'); sec.className='section'; sec.textContent=(i===0?'[A]':(i%16===0?'[B]':'')); if(sec.textContent)sheet.appendChild(sec); const sys=document.createElement('div'); sys.className='system'; DATA.bars.slice(i,i+4).forEach(b=>{const d=document.createElement('div'); d.className='measure'; d.id='bar_'+b.bar_num; d.onclick=()=>seekAll(b.start,ws.isPlaying()); d.innerHTML=`<div class="chord">${String(b.chord).replaceAll('#','♯')}</div><div class="barno">${b.bar_num}</div><div class="staff"><i style="top:0"></i><i style="top:12px"></i><i style="top:24px"></i><i style="top:36px"></i><i style="top:48px"></i></div><div class="slash">/</div><div class="root">${b.root||''} · ${Math.round((b.confidence||0)*100)}%</div>`; sys.appendChild(d);}); sheet.appendChild(sys);}}
+function renderSheet(){const sheet=$('sheet'); if(!DATA.bars.length){sheet.innerHTML='<div class="empty">Notation üretilemedi.</div>';return;} for(let i=0;i<DATA.bars.length;i+=4){const sec=document.createElement('div'); sec.className='section'; sec.textContent=(i===0?'[A]':(i%16===0?'[B]':'')); if(sec.textContent)sheet.appendChild(sec); const sys=document.createElement('div'); sys.className='system'; DATA.bars.slice(i,i+4).forEach(b=>{const d=document.createElement('div'); d.className='measure'; d.id='bar_'+b.bar_num; d.onclick=()=>seekAll(b.start,ws.isPlaying()); d.innerHTML=`<div class="chord">${String(b.chord).replaceAll('#','♯')}</div><div class="barno">${b.bar_num}</div><div class="staff"><i style="top:0"></i><i style="top:12px"></i><i style="top:24px"></i><i style="top:36px"></i><i style="top:48px"></i></div><div class="slash">/</div><div class="root">${b.root||''} · ${Math.round((b.confidence||0)*100)}%</div><div class="scale">${b.scale||''} · ${b.idea||''}</div>`; sys.appendChild(d);}); sheet.appendChild(sys);}}
 function updateBar(t){let b=DATA.bars.find(x=>t>=x.start&&t<x.end)||DATA.bars[DATA.bars.length-1]; if(!b||b.bar_num===lastBar)return; if(lastBar)$('bar_'+lastBar)?.classList.remove('active'); lastBar=b.bar_num; const el=$('bar_'+lastBar); el?.classList.add('active'); el?.scrollIntoView({block:'nearest',inline:'nearest'}); $('barStatus').textContent=`bar ${b.bar_num} • ${b.chord}`;} renderSheet();
 </script></body></html>
 """.replace("__DATA__", json.dumps(payload))
@@ -552,14 +624,14 @@ with st.container():
     with c1:
         query = st.text_input("YouTube", placeholder="YouTube linki veya şarkı adı...", label_visibility="collapsed")
     with c2:
-        mode = st.selectbox("Stem", ["Kaliteli pratik", "Hızlı demo", "Maksimum kalite", "UVR deneysel bass/drum", "Sadece akor/notasyon"], label_visibility="collapsed")
+        mode = st.selectbox("Stem", ["Mel-RoFormer + Demucs FT", "Kaliteli pratik", "Hızlı demo", "Maksimum kalite", "UVR deneysel bass/drum", "Sadece akor/notasyon"], label_visibility="collapsed")
     with c3:
         scope = st.selectbox("Süre", ["İlk 90 sn", "İlk 180 sn", "Tam şarkı"], label_visibility="collapsed")
     with c4:
         chord_engine = st.selectbox("Akor", ["Harmonic Consensus", "Essentia Consensus", "Basic Pitch MIDI + Music21", "Librosa ensemble"], label_visibility="collapsed")
     with c5:
         run = st.button("Yükle", type="primary", use_container_width=True)
-    st.markdown("<div class='small-note'>Öneri: önce Kaliteli pratik + İlk 90 sn. UVR deneysel mod ilk kullanımda model indirebilir ve uzun sürebilir.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='small-note'>Öneri: en iyi stem için Mel-RoFormer + Demucs FT + İlk 90 sn. İlk kullanımda model indirebilir ve uzun sürebilir.</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 if run and query:
@@ -593,6 +665,7 @@ if "current_path" in st.session_state and os.path.exists(st.session_state.curren
             st.session_state.sep_settings = sep_settings
             st.session_state.bpm = bpm
             st.session_state.key = key
+            bars = enrich_bars_with_scales(bars)
             st.session_state.bars = bars
             st.session_state.abc = make_abc(title, bpm, key, bars)
             st.session_state.process_key = process_key
